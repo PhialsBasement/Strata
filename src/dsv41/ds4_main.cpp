@@ -274,6 +274,9 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     return true;
 }
 
+// The pack's line-break tokens (vocab.json keys holding a newline).
+static std::vector<char> g_newline;
+
 // How a prompt lines up with a kept conversation `ref`: for each
 // prompt token the ref position it matches (-1: new), the ref spans
 // the prompt lacks (stale), and how far into ref the matching got.
@@ -327,9 +330,10 @@ static bool align_to(const std::vector<int32_t>& ref, const std::vector<int>& id
                 if ((q = find_at(i2, p)) != SIZE_MAX) break;
         }
         if (q == SIZE_MAX) break;   // (no match after it: the end, nothing to trim)
-        // the change has an end: the run before it gives up its
-        // tail (or all of it, if short) so changed lines move whole
-        const size_t keep_from = after_change && i - run_i < kMinRun ? run_p : p - std::min<size_t>(24, p - run_p);
+        // without line breaks known, the run before a change gives
+        // up its tail (all of it, if short); whole_lines does better
+        const size_t keep_from = g_newline.empty() == false ? p
+                                 : after_change && i - run_i < kMinRun ? run_p : p - std::min<size_t>(24, p - run_p);
         for (size_t t = keep_from; t < p; ++t) al.ref_of[t] = -1;
         al.matched -= p - keep_from;
         if (p > keep_from) add_stale(i - (p - keep_from), p - keep_from);
@@ -342,6 +346,116 @@ static bool align_to(const std::vector<int32_t>& ref, const std::vector<int>& id
     }
     al.ref_end = i;
     return al.matched >= c0 + 256;
+}
+
+
+static void load_newlines(const std::string& pack) {
+    std::ifstream f(pack + "/tokenizer/vocab.json", std::ios::binary);
+    const std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    for (size_t i = 0; i < s.size(); ++i) {
+        if (s[i] != '"') continue;
+        size_t j = i + 1;
+        bool nl = false;
+        for (; j < s.size() && s[j] != '"'; ++j) {
+            if (s[j] == '\\') {
+                nl = nl || s.compare(j, 6, "\\u010a") == 0 || s.compare(j, 6, "\\u010A") == 0;
+                ++j;
+            } else if ((unsigned char) s[j] == 0xC4 && j + 1 < s.size() && (unsigned char) s[j + 1] == 0x8A)
+                nl = true;
+        }
+        size_t k = j + 1;
+        while (k < s.size() && (s[k] == ' ' || s[k] == ':')) ++k;
+        if (k >= s.size() || s[k] < '0' || s[k] > '9') {
+            i = j;
+            continue;
+        }
+        const long id = std::strtol(s.c_str() + k, nullptr, 10);
+        if (id >= 0 && id < (1 << 24)) {
+            if ((size_t) id >= g_newline.size()) g_newline.resize((size_t) id + 1, 0);
+            if (nl) g_newline[(size_t) id] = 1;
+        }
+        i = k;
+    }
+}
+
+// Changed lines move whole: a line holding any new or stale token is
+// new (prompt) or stale (ref) as a whole, cuts are widened to the
+// state's group size `align`, and the stale spans are rebuilt.
+static void whole_lines(const std::vector<int32_t>& ref, const std::vector<int>& ids, Align& al, int64_t align) {
+    const auto is_nl = [](int t) { return t >= 0 && (size_t) t < g_newline.size() && g_newline[(size_t) t]; };
+    if (g_newline.empty()) return;
+    const size_t R = al.ref_end, n = ids.size();
+    std::vector<char> st(R, 0);
+    for (const auto& s : al.stale)
+        for (size_t k = s.first; k < s.first + s.second && k < R; ++k) st[k] = 1;
+    std::vector<int64_t> p_of(R, -1);
+    size_t tmax = 0;   // (the last matched prompt token: changes before it only)
+    for (size_t t = 0; t < n; ++t)
+        if (al.ref_of[t] >= 0 && (size_t) al.ref_of[t] < R) {
+            p_of[(size_t) al.ref_of[t]] = (int64_t) t;
+            tmax = t;
+        }
+    const auto unmatch_ref = [&](size_t k) {
+        st[k] = 1;
+        if (p_of[k] >= 0) al.ref_of[(size_t) p_of[k]] = -1;
+        p_of[k] = -1;
+    };
+    for (bool changed = true; changed;) {
+        changed = false;
+        for (size_t a = 0; a <= tmax;) {   // (prompt lines with a new token)
+            size_t b = a;
+            while (b < n - 1 && is_nl(ids[b]) == false) ++b;
+            if (b <= tmax) {
+                bool any_new = false, any_old = false;
+                for (size_t t = a; t <= b; ++t) (al.ref_of[t] < 0 ? any_new : any_old) = true;
+                if (any_new && any_old) {
+                    for (size_t t = a; t <= b; ++t)
+                        if (al.ref_of[t] >= 0 && (size_t) al.ref_of[t] < R) unmatch_ref((size_t) al.ref_of[t]);
+                    changed = true;
+                }
+            }
+            a = b + 1;
+        }
+        for (size_t a = 0; a < R;) {   // (ref lines with a stale token)
+            size_t b = a;
+            while (b < ref.size() - 1 && is_nl(ref[b]) == false) ++b;
+            if (b < R) {
+                bool any_st = false, any_ok = false;
+                for (size_t k = a; k <= b; ++k) (st[k] ? any_st : any_ok) = true;
+                if (any_st && any_ok) {
+                    for (size_t k = a; k <= b; ++k) unmatch_ref(k);
+                    changed = true;
+                }
+            }
+            a = b + 1;
+        }
+        for (size_t k = 0; k < R; ++k) {   // (cuts widened to the group size)
+            if (st[k] == 0) continue;
+            const bool starts = k == 0 || st[k - 1] == 0;
+            const bool ends = k + 1 == R || st[k + 1] == 0;
+            if (starts && k % (size_t) align != 0 && st[k - 1] == 0) {
+                unmatch_ref(k - 1);
+                changed = true;
+            }
+            if (ends && (k + 1) % (size_t) align != 0 && k + 1 < R && st[k + 1] == 0) {
+                unmatch_ref(k + 1);
+                changed = true;
+            }
+        }
+    }
+    al.stale.clear();
+    for (size_t k = 0; k < R;) {
+        if (st[k] == 0) {
+            ++k;
+            continue;
+        }
+        size_t e = k;
+        while (e < R && st[e]) ++e;
+        al.stale.push_back({k, e - k});
+        k = e;
+    }
+    al.matched = 0;
+    for (int64_t r : al.ref_of) al.matched += r >= 0;
 }
 
 // The prompt with its tokens matched to ref[0, upto) first (in ref
@@ -471,6 +585,12 @@ bool parse_gen(const std::string& line, Req& r, bool geni) {
 
 int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float conf_min, const std::string& pack) {
     std::vector<int> eos = parse_ids(eos_list);
+    load_newlines(pack);
+    {
+        size_t nl = 0;
+        for (char c : g_newline) nl += c;
+        std::fprintf(stderr, "ds4 serve: %zu line-break tokens (changed lines move whole)\n", nl);
+    }
     for (const std::string& l : m.info_lines()) std::printf("%s\n", l.c_str());
     std::printf("READY %lld stop\n", (long long) m.max_context());
     std::fflush(stdout);
@@ -866,6 +986,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const auto consider = [&](long k, const std::vector<int32_t>& t, std::vector<int64_t> at_ck) {
                 Align a2;
                 if (t.empty() || align_to(t, r.ids, a2) == false) return;
+                whole_lines(t, r.ids, a2, m.splice_align());
                 const size_t se = a2.stale.empty() ? 0 : a2.stale.back().first + a2.stale.back().second;
                 at_ck.push_back((int64_t) t.size());
                 int64_t e2 = -1;
