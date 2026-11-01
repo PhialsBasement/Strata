@@ -764,6 +764,8 @@ struct Layer {
           *ik_norm = nullptr, *sink = nullptr, *hca_fn = nullptr, *hca_scale = nullptr, *hca_base = nullptr,
           *hcf_fn = nullptr, *hcf_scale = nullptr, *hcf_base = nullptr, *gate_bias = nullptr, *eg_w = nullptr,
           *gate_bias_vl = nullptr;   // (the image tokens' routing bias, with the vision tower)
+    float* res_bias = nullptr;          // prompt routing bias: resident only
+    std::vector<float> h_gate_bias, h_res_bias;
     uint16_t* i_wproj = nullptr;
     float* gate_w = nullptr;   // the router's weights, F32 (DeepSeek's inference computes the gate in F32)
     uint8_t* win = nullptr;                     // [win] rows of kKvFp8 (kv_row_bytes)
@@ -1209,6 +1211,46 @@ struct Model::Impl {
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
     size_t zc_stride = 0;
     bool zc_copy = true;               // DS4_STORE_STAGE=0: the expert kernels read the arena over PCIe themselves
+    // STRATA_DS4_PROMPT_RESIDENT (1 = on, 0 = off): while a prompt
+    // is read, tokens pick only experts in VRAM or RAM (no disk
+    // reads); the reply's tokens route as the model was trained
+    const bool prompt_resident = [] {
+        const char* v = std::getenv("STRATA_DS4_PROMPT_RESIDENT");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    bool resident(const Layer& l, int e) const {
+        if (l.slot.empty() == false && l.slot[(size_t) e] >= 0) return true;
+        if (store && store->find(l.il, e) >= 0) return true;
+        return in_ram(l, e);
+    }
+    // the bias that keeps a prompt's routing on resident experts,
+    // into l.res_bias (null when it cannot be had: route as usual)
+    const float* resident_bias(Dev& d, Layer& l, cudaStream_t s) {
+        if (prompt_resident == false || l.gate_bias == nullptr || l.mtp) return nullptr;
+        const size_t n = (size_t) l.n_exp;
+        std::string err;
+        if (l.res_bias == nullptr && dalloc(d, l.res_bias, n, err) == false) return nullptr;
+        if (l.h_gate_bias.size() != n) {
+            l.h_gate_bias.resize(n);
+            if (cudaMemcpy(l.h_gate_bias.data(), l.gate_bias, n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                l.h_gate_bias.clear();
+                return nullptr;
+            }
+        }
+        const Layer& lead = L[(size_t) l.il];
+        l.h_res_bias.resize(n);
+        int kept = 0;
+        for (size_t e = 0; e < n; ++e) {
+            const bool r = resident(lead, (int) e);
+            kept += r;
+            l.h_res_bias[e] = l.h_gate_bias[e] + (r ? 0.0f : -1.0e4f);
+        }
+        if (kept < 2 * l.k_exp) return nullptr;   // (too few here: route as usual)
+        if (cudaMemcpyAsync(l.res_bias, l.h_res_bias.data(), n * 4, cudaMemcpyHostToDevice, s) != cudaSuccess ||
+            cudaStreamSynchronize(s) != cudaSuccess)   // (the host buffer is rewritten next chunk)
+            return nullptr;
+        return l.res_bias;
+    }
     bool in_ram(const Layer& l, int e) const {   // (DISK_SKIP_W) expert e's pages in RAM now
         if (!l.ram.empty() && l.ram[(size_t) e] >= 0) return true;
         if (l.lay.fmt == gg::kFmtMXFP4) {
@@ -3904,6 +3946,7 @@ struct Model::Impl {
         const bool early = c.it_spec < 2u * (uint64_t) c.ring_n || (double) c.it_spec_unused <= waste * (double) c.it_spec;
         for (int e : l.host_list) {
             if (!early) break;
+            if (prompt_resident && resident(l, e) == false) continue;   // (never picked now)
             const double p = sum > 0 ? pr[e] / sum : 0.0;
             const double q = p >= 1.0 ? 1.0 : 1.0 - std::exp(picks * std::log1p(-p));
             if (q >= spec_q && spec_q <= 1.0) cand.push_back({q, e});
@@ -8462,11 +8505,12 @@ struct Model::Impl {
         hc_pre_norm(c.h, c.a_pre, l.ffn_norm, D, H, T, g.eps, c.x, s);
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
         gemv_f32(l.gate_w, c.x, l.n_exp, D, T, c.glog, 1024, s);   // (F32 x: the token path's bits)
+        const float* rbias = resident_bias(d, l, s);
         for (int r0 = 0; r0 < T; r0 += kVlRows) {   // (route()'s image bits cover kVlRows rows a call)
             const int nr = std::min(kVlRows, T - r0);
             VlBits vb;
             const bool vl = l.gate_bias_vl != nullptr && vl_bits(p0 + r0, nr, vb);
-            route(c.glog + (size_t) r0 * 1024, l.gate_bias, l.n_exp, l.k_exp, nr, g.route_scale,
+            route(c.glog + (size_t) r0 * 1024, rbias != nullptr ? rbias : l.gate_bias, l.n_exp, l.k_exp, nr, g.route_scale,
                   c.ridx + (size_t) r0 * kPicks, c.rw + (size_t) r0 * kPicks, s, l.gate_bias_vl, vl ? &vb : nullptr);
         }
         const int n_vs = L0.n_slots + (int) L0.host_list.size();
