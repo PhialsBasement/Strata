@@ -859,26 +859,34 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const char* v = std::getenv("STRATA_DS4_REORDER");
             return v == nullptr || std::atoi(v) != 0;
         }();
-        if (reorder_on && reuse && pics.empty()) {   // (the state in the model, else the newest kept one)
-            long ref_slot = -1;
-            if (m.tokens().empty()) {
-                uint64_t newest = 0;
-                for (size_t k = 0; k < slots.size(); ++k)
-                    if (slots[k].used >= newest) {
-                        newest = slots[k].used;
-                        ref_slot = (long) k;
-                    }
-            }
-            const std::vector<int32_t>* ref = ref_slot >= 0 ? &slots[(size_t) ref_slot].tokens
-                                              : m.tokens().empty() ? nullptr : &m.tokens();
+        if (reorder_on && reuse && pics.empty()) {   // (every kept conversation: the one that reuses most)
+            long ref_slot = -2;   // (-1: the state in the model)
             Align al;
-            if (ref != nullptr && align_to(*ref, r.ids, al)) {
-                const size_t stale_end = al.stale.empty() ? 0 : al.stale.back().first + al.stale.back().second;
-                int64_t E = -1;   // (the latest point of ref to resume at, past every stale span)
-                std::vector<int64_t> at_ck = ref_slot >= 0 ? slots[(size_t) ref_slot].cks : m.check_positions();
-                at_ck.push_back((int64_t) ref->size());
+            int64_t E = -1, best_gain = 0;
+            const auto consider = [&](long k, const std::vector<int32_t>& t, std::vector<int64_t> at_ck) {
+                Align a2;
+                if (t.empty() || align_to(t, r.ids, a2) == false) return;
+                const size_t se = a2.stale.empty() ? 0 : a2.stale.back().first + a2.stale.back().second;
+                at_ck.push_back((int64_t) t.size());
+                int64_t e2 = -1;
                 for (int64_t c : at_ck)
-                    if (c <= (int64_t) al.ref_end && c > (int64_t) stale_end && c > E) E = c;
+                    if (c <= (int64_t) a2.ref_end && c > (int64_t) se && c > e2) e2 = c;
+                int64_t cut = 0;
+                for (const auto& s : a2.stale) cut += (int64_t) s.second;
+                if (e2 >= 256 && e2 - cut > best_gain) {
+                    best_gain = e2 - cut;
+                    E = e2;
+                    ref_slot = k;
+                    al = std::move(a2);
+                }
+            };
+            consider(-1, m.tokens(), m.check_positions());
+            for (size_t k = 0; k < slots.size(); ++k) consider((long) k, slots[k].tokens, slots[k].cks);
+            const std::vector<int32_t>* ref = ref_slot >= 0 ? &slots[(size_t) ref_slot].tokens
+                                              : ref_slot == -1 ? &m.tokens() : nullptr;
+            if (ref != nullptr) {
+                const size_t stale_end = al.stale.empty() ? 0 : al.stale.back().first + al.stale.back().second;
+                (void) stale_end;
                 size_t n_alike = 0;
                 if (E < 256) {
                     // (nothing kept to resume at: the prompt stays as sent)
@@ -888,8 +896,16 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     std::string e;
                     if (ref_slot < 0) slot_put("");                       // (the conversation it was stays kept)
                     bool ok = true;
-                    if (ref_slot >= 0) {
-                        if (m.tokens().empty() == false) slot_put("");
+                    if (ref_slot >= 0 && m.tokens().empty() == false) {
+                        const std::vector<int32_t> want = slots[(size_t) ref_slot].tokens;
+                        slot_put("");   // (it can drop or move kept ones: find the target again)
+                        ref_slot = -2;
+                        for (size_t k = 0; k < slots.size(); ++k)
+                            if (slots[k].tokens == want) ref_slot = (long) k;
+                        ok = ref_slot >= 0;
+                        if (ok == false) e = "the kept conversation went away";
+                    }
+                    if (ok && ref_slot >= 0) {
                         Slot& sl = slots[(size_t) ref_slot];
                         std::vector<uint8_t> file;
                         const uint8_t* bytes = nullptr;
