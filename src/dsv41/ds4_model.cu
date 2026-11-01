@@ -1218,6 +1218,7 @@ struct Model::Impl {
         const char* v = std::getenv("STRATA_DS4_PROMPT_RESIDENT");
         return v == nullptr || std::atoi(v) != 0;
     }();
+    bool prompt_feed = false;   // (feed / feed_mark: a prompt is read)
     bool resident(const Layer& l, int e) const {
         if (l.slot.empty() == false && l.slot[(size_t) e] >= 0) return true;
         if (store && store->find(l.il, e) >= 0) return true;
@@ -10472,10 +10473,12 @@ struct Model::Impl {
                 float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
                 gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
                                                                          // weights instead: the same hit rate)
-                route_ahead(gl, nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
+                const float* nb = prompt_feed ? resident_bias(d, const_cast<Layer&>(*nx), s) : nullptr;
+                route_ahead(gl, nb != nullptr ? nb : nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
                 na[a - 1] = m;
             }
-            route_publish(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
+            const float* wb = prompt_feed ? resident_bias(d, l, s) : nullptr;
+            route_publish(d.glog, wb != nullptr ? wb : l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
                           na[1]);
             if (!mv(d, {job(l.s1, d.x, d.sg, T, D, FF), job(l.s3, d.x, d.su, T, D, FF)}, err)) return false;
@@ -10579,7 +10582,8 @@ struct Model::Impl {
         gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
         VlBits vb = {};
         vb.w[0] = l.mtp ? 0u : wp.vl;
-        route(d.glog, l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, d.ridx, d.rw, s, l.gate_bias_vl,
+        const float* hb = prompt_feed ? resident_bias(d, l, s) : nullptr;
+        route(d.glog, hb != nullptr ? hb : l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, d.ridx, d.rw, s, l.gate_bias_vl,
               vb.w[0] != 0 ? &vb : nullptr);
         CK(cudaMemcpyAsync(h_idx, d.ridx, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
         CK(cudaMemcpyAsync(h_w, d.rw, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
@@ -10857,8 +10861,17 @@ Model::Model() : p_(new Impl) {}
 Model::~Model() = default;
 bool Model::load(const Options& o, std::string& err) { return p_->load(o, err); }
 bool Model::step(int token, bool logits, std::string& err) { return p_->step(token, logits, err); }
+namespace {
+struct PromptFeed {   // (marks a prompt read for the window path)
+    bool& f;
+    explicit PromptFeed(bool& b) : f(b) { f = true; }
+    ~PromptFeed() { f = false; }
+};
+}   // namespace
+
 bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     Impl& p = *p_;
+    PromptFeed pf(p.prompt_feed);
     p.pm.last = -1;
     p.halted = false;
     if (ds4_dbg("DS4_DBG_CHUNK")) std::fprintf(stderr, "feed n %d chunk %d chunk_min %d\n", n, p.chunk, p.chunk_min);
@@ -10873,6 +10886,7 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
 }
 bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
     Impl& p = *p_;
+    PromptFeed pf(p.prompt_feed);
     p.pm.last = -1;
     p.halted = false;
     const double t0 = now_ms();
