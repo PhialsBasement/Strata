@@ -51,6 +51,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace {
@@ -271,6 +272,89 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
     g_rt.step_d += rt_seq() - rs2;
     ++g_rt.steps;
     return true;
+}
+
+// How a prompt lines up with a kept conversation `ref`: for each
+// prompt token the ref position it matches (-1: new), the ref spans
+// the prompt lacks (stale), and how far into ref the matching got.
+struct Align {
+    std::vector<int64_t> ref_of;
+    std::vector<std::pair<size_t, size_t>> stale;   // (start, length) in ref
+    size_t ref_end = 0, matched = 0;
+};
+
+static bool align_to(const std::vector<int32_t>& ref, const std::vector<int>& ids, Align& al) {
+    constexpr size_t K = 32, kMaxSkip = 1 << 16;
+    const size_t n = ids.size();
+    size_t c0 = 0;
+    while (c0 < ref.size() && c0 < n && ref[c0] == ids[c0]) ++c0;
+    if (c0 == ref.size() || n < 2 * K || ref.size() < c0 + K) return false;
+    auto gram = [](const auto* p) {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t t = 0; t < K; ++t) h = (h ^ (uint32_t) p[t]) * 1099511628211ull;
+        return h;
+    };
+    std::unordered_map<uint64_t, std::vector<uint32_t>> at;
+    for (size_t q = c0; q + K <= n - 1; ++q) at[gram(ids.data() + q)].push_back((uint32_t) q);
+    const auto find_at = [&](size_t i, size_t from) -> size_t {   // ref[i..i+K) in ids at >= from
+        const auto hit = at.find(gram(ref.data() + i));
+        if (hit == at.end()) return SIZE_MAX;
+        for (uint32_t q : hit->second)
+            if (q >= from && std::equal(ref.begin() + (long) i, ref.begin() + (long) (i + K), ids.begin() + q)) return q;
+        return SIZE_MAX;
+    };
+    al = Align{};
+    al.ref_of.assign(n, -1);
+    size_t i = 0, p = 0, run_i = 0, run_p = 0;
+    bool after_change = false;
+    // A short match between two changes is part of the change: a
+    // line's shared start stays with the rest of the changed line.
+    constexpr size_t kMinRun = 64;
+    const auto add_stale = [&](size_t s, size_t len) {
+        if (al.stale.empty() == false && al.stale.back().first + al.stale.back().second == s) al.stale.back().second += len;
+        else al.stale.push_back({s, len});
+    };
+    while (p + 1 < n && i < ref.size()) {
+        if (ref[i] == ids[p]) {
+            al.ref_of[p++] = (int64_t) i++;
+            ++al.matched;
+            continue;
+        }
+        if (i + K > ref.size()) break;
+        size_t i2 = i, q = find_at(i, p + 1);   // (the prompt has new tokens here)
+        if (q == SIZE_MAX) {                     // (ref has tokens the prompt lacks)
+            for (i2 = i + 1; i2 + K <= ref.size() && i2 <= i + kMaxSkip; ++i2)
+                if ((q = find_at(i2, p)) != SIZE_MAX) break;
+        }
+        if (q == SIZE_MAX) break;   // (no match after it: the end, nothing to trim)
+        // the change has an end: the run before it gives up its
+        // tail (or all of it, if short) so changed lines move whole
+        const size_t keep_from = after_change && i - run_i < kMinRun ? run_p : p - std::min<size_t>(24, p - run_p);
+        for (size_t t = keep_from; t < p; ++t) al.ref_of[t] = -1;
+        al.matched -= p - keep_from;
+        if (p > keep_from) add_stale(i - (p - keep_from), p - keep_from);
+        if (i2 > i) add_stale(i, i2 - i);
+        after_change = true;
+        i = i2;
+        p = q;
+        run_i = i;
+        run_p = p;
+    }
+    al.ref_end = i;
+    return al.matched >= c0 + 256;
+}
+
+// The prompt with its tokens matched to ref[0, upto) first (in ref
+// order), then the rest in their own order.
+static std::vector<int> alike_first(const std::vector<int>& ids, const Align& al, int64_t upto, size_t& n_alike) {
+    std::vector<int> out;
+    out.reserve(ids.size());
+    for (size_t t = 0; t < ids.size(); ++t)
+        if (al.ref_of[t] >= 0 && al.ref_of[t] < upto) out.push_back(ids[t]);
+    n_alike = out.size();
+    for (size_t t = 0; t < ids.size(); ++t)
+        if (al.ref_of[t] >= upto || al.ref_of[t] < 0) out.push_back(ids[t]);
+    return out;
 }
 
 struct Req {
@@ -770,6 +854,90 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (!reuse) {   // (STRATA_DS4_REUSE=0, for A/Bs and tests: every request is a fresh read of its whole prompt)
             m.reset();
             held.clear();
+        }
+        static const bool reorder_on = [] {
+            const char* v = std::getenv("STRATA_DS4_REORDER");
+            return v == nullptr || std::atoi(v) != 0;
+        }();
+        if (reorder_on && reuse && pics.empty()) {   // (the state in the model, else the newest kept one)
+            long ref_slot = -1;
+            if (m.tokens().empty()) {
+                uint64_t newest = 0;
+                for (size_t k = 0; k < slots.size(); ++k)
+                    if (slots[k].used >= newest) {
+                        newest = slots[k].used;
+                        ref_slot = (long) k;
+                    }
+            }
+            const std::vector<int32_t>* ref = ref_slot >= 0 ? &slots[(size_t) ref_slot].tokens
+                                              : m.tokens().empty() ? nullptr : &m.tokens();
+            Align al;
+            if (ref != nullptr && align_to(*ref, r.ids, al)) {
+                const size_t stale_end = al.stale.empty() ? 0 : al.stale.back().first + al.stale.back().second;
+                int64_t E = -1;   // (the latest point of ref to resume at, past every stale span)
+                std::vector<int64_t> at_ck = ref_slot >= 0 ? slots[(size_t) ref_slot].cks : m.check_positions();
+                at_ck.push_back((int64_t) ref->size());
+                for (int64_t c : at_ck)
+                    if (c <= (int64_t) al.ref_end && c > (int64_t) stale_end && c > E) E = c;
+                size_t n_alike = 0;
+                if (E < 256) {
+                    // (nothing kept to resume at: the prompt stays as sent)
+                } else if (al.stale.empty()) {
+                    r.ids = alike_first(r.ids, al, INT64_MAX, n_alike);
+                } else {
+                    std::string e;
+                    if (ref_slot < 0) slot_put("");                       // (the conversation it was stays kept)
+                    bool ok = true;
+                    if (ref_slot >= 0) {
+                        if (m.tokens().empty() == false) slot_put("");
+                        Slot& sl = slots[(size_t) ref_slot];
+                        std::vector<uint8_t> file;
+                        const uint8_t* bytes = nullptr;
+                        size_t nb = 0;
+                        if (sl.data) {
+                            bytes = sl.data->data();
+                            nb = sl.data->size();
+                        } else {
+                            std::ifstream f(sl.path, std::ios::binary);
+                            file.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+                            bytes = file.data();
+                            nb = file.size();
+                        }
+                        ok = nb > 0 && m.slot_load(bytes, nb, (int64_t) sl.tokens.size(), e);
+                    }
+                    if (ok && E < m.pos()) ok = m.restore(E) && m.pos() == E;
+                    const int64_t A = m.splice_align();
+                    int64_t cut = 0;
+                    for (size_t k = al.stale.size(); ok && k-- > 0;) {   // (last first: earlier spans keep their place)
+                        const int64_t a = ((int64_t) al.stale[k].first + A - 1) / A * A;
+                        const int64_t b = ((int64_t) (al.stale[k].first + al.stale[k].second)) / A * A;
+                        if (b > a) {
+                            ok = m.splice_out(a, b - a, e);
+                            cut += ok ? b - a : 0;
+                        }
+                    }
+                    if (ok) {
+                        m.checkpoint(3);   // (the next prompt behind this start goes back here)
+                        std::vector<int> out(m.tokens().begin(), m.tokens().end());
+                        for (size_t t = 0; t < r.ids.size(); ++t)
+                            if (al.ref_of[t] >= E || al.ref_of[t] < 0) out.push_back(r.ids[t]);
+                        n_alike = m.tokens().size();
+                        r.ids.swap(out);
+                        std::fprintf(stderr, "ds4 serve: spliced %lld stale tokens out of a kept conversation; "
+                                     "%zu tokens reused, %zu to read\n", (long long) cut, n_alike, r.ids.size() - n_alike);
+                    } else {
+                        std::fprintf(stderr, "ds4 serve: splice failed (%s) - reading the prompt again\n", e.c_str());
+                        m.reset();
+                        held.clear();
+                        r.ids = alike_first(r.ids, al, INT64_MAX, n_alike);
+                    }
+                }
+                if (n_alike >= 256 && n_alike + 1 < r.ids.size()) {
+                    r.pin = (long long) n_alike;
+                    std::fprintf(stderr, "ds4 serve: alike tokens first: %zu, new after them: %zu\n", n_alike,
+                                 r.ids.size() - n_alike);
+                }
+            }
         }
         const auto& st = m.tokens();
         const size_t n_state = st.size();

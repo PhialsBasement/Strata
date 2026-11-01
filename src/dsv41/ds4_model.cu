@@ -1109,6 +1109,10 @@ struct Model::Impl {
                                       // server said the prompt's shared start - system prompt and tools - ends: another
                                       // agent behind the same start goes back to it)
     bool slot_held = false;           // slot_save took this state and nothing has changed it since
+    // splice_out's RoPE gaps: positions from .first on are
+    // rotated .second further (the cut spans' lengths summed)
+    std::vector<std::pair<int64_t, int64_t>> cuts;
+    int64_t rope_off = 0;
     std::vector<uint32_t> prof;       // [nl][n_exp] routed-expert hits
     Stats st;
     int cur_topk_n[kWin] = {}, cur_cand_n[kWin] = {};   // what the latest indexer / candidate source left, per query
@@ -5672,6 +5676,8 @@ struct Model::Impl {
         toks.clear();
         ctoks.clear();
         slot_held = false;
+        cuts.clear();
+        rope_off = 0;
         for (Check& c0 : ck) c0.pos = -1;
         for (Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m) {
@@ -5780,6 +5786,77 @@ struct Model::Impl {
         slot_held = false;
         for (Check& o2 : ck)   // a later checkpoint saw tokens the state no longer has
             if (o2.pos > pos) o2.pos = -1;
+        while (cuts.empty() == false && cuts.back().first >= pos) cuts.pop_back();
+        rope_off = cuts.empty() ? 0 : cuts.back().second;
+        return true;
+    }
+
+    // Cut d tokens at a out of the state: later source rows move
+    // down, each ring rotates, and the RoPE gap goes into `cuts`
+    // (rows keep their rotation; new positions add rope_off).
+    bool splice_out(int64_t a, int64_t d, std::string& err) {
+        int64_t align = 1;
+        for (int r : g.ratios) align = std::lcm(align, (int64_t) std::max(1, r));
+        if (a < 0 || d <= 0 || a % align != 0 || d % align != 0 || a + d + g.win > pos || imgs.empty() == false) {
+            err = "the span cannot be cut here";
+            return false;
+        }
+        for (Dev& dv : devs) {
+            cudaSetDevice(dv.id);
+            cudaDeviceSynchronize();
+        }
+        for (const Src& s : srcs) {
+            const int64_t R = std::max(1, s.ratio), dst = a / R, src = (a + d) / R, n = pos / R - src, step = d / R;
+            for (size_t di = 0; di < devs.size(); ++di) {
+                cudaSetDevice(devs[di].id);
+                uint8_t* bufs[2] = {s.ckv[di], s.ik[di]};
+                const size_t rbs[2] = {ckv_rb(), ik_rb()};
+                for (int b = 0; b < 2; ++b) {
+                    if (bufs[b] == nullptr) continue;
+                    for (int64_t k = 0; k < n; k += step) {   // (chunks of `step` rows never overlap)
+                        const int64_t m = std::min(step, n - k);
+                        if (cudaMemcpy(bufs[b] + (size_t) (dst + k) * rbs[b], bufs[b] + (size_t) (src + k) * rbs[b],
+                                       (size_t) m * rbs[b], cudaMemcpyDeviceToDevice) != cudaSuccess) {
+                            err = std::string("moving source rows: ") + cudaGetErrorString(cudaGetLastError());
+                            return false;
+                        }
+                    }
+                }
+            }
+        }
+        const size_t rb = win_rb(), wb = (size_t) g.win * rb, sh = (size_t) (d % g.win);
+        std::vector<uint8_t> was(wb), now(wb);
+        for (Layer& l0 : L)
+            for (int mi = 0; mi < l0.nm; ++mi) {
+                Layer& l = member(l0, mi);
+                cudaSetDevice(devs[(size_t) l.dev].id);
+                if (cudaMemcpy(was.data(), l.win, wb, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+                for (size_t j = 0; j < (size_t) g.win; ++j)   // (slot p % win holds p; p moves to p - d)
+                    std::memcpy(now.data() + j * rb, was.data() + ((j + sh) % (size_t) g.win) * rb, rb);
+                if (cudaMemcpy(l.win, now.data(), wb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                    err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            }
+        int64_t before = 0;
+        for (auto& c : cuts)
+            if (c.first <= a) before = c.second;
+        for (auto& c : cuts)
+            if (c.first > a) {
+                c.first -= d;
+                c.second += d;
+            }
+        cuts.push_back({a, before + d});
+        std::sort(cuts.begin(), cuts.end());
+        rope_off = cuts.back().second;
+        toks.erase(toks.begin() + a, toks.begin() + a + d);
+        ctoks.erase(ctoks.begin() + a, ctoks.begin() + a + d);
+        pos -= d;
+        for (Check& c0 : ck) c0.pos = -1;
+        slot_held = false;
         return true;
     }
 
@@ -5801,8 +5878,10 @@ struct Model::Impl {
         for (const Layer& l : L) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
         for (const Src& s : srcs) n += 8 + (size_t) src_rows(s) * (ckv_rb() + ik_rb());
         n += 8 + slot_checks().size() * check_bytes();   // (the checkpoints: what the slot can be taken back at)
+        if (cuts.empty() == false) n += 16 + cuts.size() * 16;   // (splice_out's gaps, only when there are some)
         return n + 8;
     }
+    static constexpr uint64_t kCutsMagic = 0x3153545543345344ull;   // "DS4CUTS1"
 
     uint64_t slot_save(std::vector<uint8_t>& out, std::string& err) {
         if (slot_held) {
@@ -5898,6 +5977,15 @@ struct Model::Impl {
                         put(c.comp[2 * i + 1].data(), (size_t) L[i].ratio * g.hd * 4);
                     }
                 }
+            }
+        }
+        if (cuts.empty() == false) {
+            const uint64_t nk = cuts.size();
+            put(&kCutsMagic, 8);
+            put(&nk, 8);
+            for (const auto& c : cuts) {
+                put(&c.first, 8);
+                put(&c.second, 8);
             }
         }
         if (off + 8 != out.size()) {
@@ -6098,10 +6186,35 @@ struct Model::Impl {
         }
         std::memcpy(&end, data + off, 8);
         off += 8;
+        std::vector<std::pair<int64_t, int64_t>> cuts_in;
+        if (end == kCutsMagic) {
+            uint64_t nk = 0;
+            if (room(8) == false) {
+                err = "the slot is cut short";
+                return false;
+            }
+            std::memcpy(&nk, data + off, 8);
+            off += 8;
+            if (nk > 4096 || room((size_t) nk * 16 + 8) == false) {
+                err = "the slot's splice gaps are damaged";
+                return false;
+            }
+            for (uint64_t k = 0; k < nk; ++k) {
+                int64_t c0 = 0, c1 = 0;
+                std::memcpy(&c0, data + off, 8);
+                std::memcpy(&c1, data + off + 8, 8);
+                off += 16;
+                cuts_in.push_back({c0, c1});
+            }
+            std::memcpy(&end, data + off, 8);
+            off += 8;
+        }
         if (end != kSlotMagic) {
             err = "the slot does not end where it should";
             return false;
         }
+        cuts.swap(cuts_in);
+        rope_off = cuts.empty() ? 0 : cuts.back().second;
         pos = n_pos;
         toks.swap(toks_in);
         ctoks.resize((size_t) pos);
@@ -7723,7 +7836,7 @@ struct Model::Impl {
                 fk.w = l.kv_norm;
                 fk.eps = g.eps;
                 fk.rd = g.rd;
-                fk.pos = (int) (p0 + a);
+                fk.pos = (int) (p0 + a + rope_off);
                 fk.freqs = d.freqs_win;
                 fk.quant = 1;
                 fk.dst = d.ext + (size_t) g.win * HD;
@@ -8143,7 +8256,7 @@ struct Model::Impl {
             fk.w = l.kv_norm;
             fk.eps = g.eps;
             fk.rd = g.rd;
-            fk.pos = (int) p0;
+            fk.pos = (int) (p0 + rope_off);
             fk.freqs = freqs;
             fk.quant = 1;
             fk.dst = c.ext + (size_t) g.win * HD;
@@ -8195,7 +8308,7 @@ struct Model::Impl {
                     fi.w = l.ik_norm;
                     fi.eps = g.eps;
                     fi.rd = g.rd;
-                    fi.pos = (int) (g_first * R);
+                    fi.pos = (int) (g_first * R + rope_off);
                     fi.pos_step = R;
                     fi.freqs = freqs;
                     fi.quant = 3;
@@ -8215,7 +8328,7 @@ struct Model::Impl {
                             return false;
                         Finish fi;
                         fi.rd = g.rd;
-                        fi.pos = (int) pa;
+                        fi.pos = (int) (pa + rope_off);
                         fi.vpp = g.ix_heads;
                         fi.freqs = freqs;
                         fi.quant = 3;
@@ -8257,7 +8370,7 @@ struct Model::Impl {
             if (l.kv_src && ng > 0) {
                 Finish fc;
                 fc.rd = g.rd;
-                fc.pos = (int) (g_first * R);
+                fc.pos = (int) (g_first * R + rope_off);
                 fc.pos_step = R;
                 fc.freqs = freqs;
                 fc.quant = 2;
@@ -8296,7 +8409,7 @@ struct Model::Impl {
             if (!gemm(d, c, l.wq_b, c.qr16 + (size_t) a0 * g.q_lora, g.q_lora, na, c.q, HQ, 0.0f, err)) return false;
             Finish fr;
             fr.rd = g.rd;
-            fr.pos = (int) (p0 + a0);
+            fr.pos = (int) (p0 + a0 + rope_off);
             fr.vpp = NHL;
             fr.freqs = freqs;
             finish(c.q, na * NHL, HD, HD, fr, s);
@@ -8315,7 +8428,7 @@ struct Model::Impl {
             if (a0 == 0 && na == T) dump_sub(d, "o", l.il, p0, T, c.o, (size_t) T * HQ * 4);
             Finish fo;
             fo.rd = g.rd;
-            fo.pos = (int) (p0 + a0);
+            fo.pos = (int) (p0 + a0 + rope_off);
             fo.vpp = NHL;
             fo.freqs = freqs;
             fo.inverse = 1;
@@ -9247,6 +9360,7 @@ struct Model::Impl {
             cudaSetDevice(devs[di].id);
             cudaStreamSynchronize(devs[di].st);   // (nothing of the run's still reads or writes them: the device's
             cudaStreamSynchronize(c.cs);          // copies done, every read the run issued done - a failed run's too)
+            cudaDeviceSynchronize();              // every stream: a freed buffer read late faults the GPU
             for (size_t i = c.base; i < c.n_read; ++i)
                 while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_any(500);
             if (c.lm_pinned) cudaFreeHost(c.lm_state);
@@ -10081,7 +10195,7 @@ struct Model::Impl {
             if (!mv(d, {job(l.wq_b, d.qr, d.q, T, g.q_lora, HQ)}, err)) return false;
             Finish fr;
             fr.rd = g.rd;
-            fr.pos = (int) p0;
+            fr.pos = (int) (p0 + rope_off);
             fr.vpp = NHL;
             fr.freqs = freqs;
             finish(d.q, T * NHL, HD, HD, fr, s);
@@ -10095,7 +10209,7 @@ struct Model::Impl {
         fk.w = l.kv_norm;
         fk.eps = g.eps;
         fk.rd = g.rd;
-        fk.pos = (int) p0;
+        fk.pos = (int) (p0 + rope_off);
         fk.freqs = freqs;
         fk.quant = 1;
         fk.dst = d.ext + (size_t) g.win * HD;
@@ -10161,7 +10275,7 @@ struct Model::Impl {
                     fi.w = l.ik_norm;
                     fi.eps = g.eps;
                     fi.rd = g.rd;
-                    fi.pos = (int) (g_first * R);
+                    fi.pos = (int) (g_first * R + rope_off);
                     fi.pos_step = R;
                     fi.freqs = freqs;
                     fi.quant = 3;
@@ -10176,7 +10290,7 @@ struct Model::Impl {
                     if (!mv(d, {job(l.i_wq_b, d.qr, d.iq, T, g.q_lora, (size_t) g.ix_heads * g.ix_hd)}, err)) return false;
                     Finish fi;
                     fi.rd = g.rd;
-                    fi.pos = (int) p0;
+                    fi.pos = (int) (p0 + rope_off);
                     fi.vpp = g.ix_heads;
                     fi.freqs = freqs;
                     fi.quant = 3;
@@ -10223,7 +10337,7 @@ struct Model::Impl {
             if (l.kv_src && ng > 0) {
                 Finish fc;
                 fc.rd = g.rd;
-                fc.pos = (int) (g_first * R);
+                fc.pos = (int) (g_first * R + rope_off);
                 fc.pos_step = R;
                 fc.freqs = freqs;
                 fc.quant = 2;
@@ -10264,7 +10378,7 @@ struct Model::Impl {
             dump_sub(d, "o", l.il, p0, T, d.o, (size_t) T * HQ * 4);
             Finish fo;
             fo.rd = g.rd;
-            fo.pos = (int) p0;
+            fo.pos = (int) (p0 + rope_off);
             fo.vpp = NHL;
             fo.freqs = freqs;
             fo.inverse = 1;
@@ -10763,6 +10877,12 @@ const std::vector<int32_t>& Model::tokens() const { return p_->toks; }
 void Model::reset() { p_->reset(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
+bool Model::splice_out(int64_t a, int64_t d, std::string& err) { return p_->splice_out(a, d, err); }
+int64_t Model::splice_align() const {
+    int64_t align = 1;
+    for (int r : p_->g.ratios) align = std::lcm(align, (int64_t) std::max(1, r));
+    return align;
+}
 void Model::pin() { p_->pin(); }
 std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }

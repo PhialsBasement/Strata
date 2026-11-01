@@ -165,6 +165,11 @@ public:
     /// restore(limit) goes back to the latest one at or before limit (-1: none).
     void checkpoint(int slot = 0);
     bool restore(int64_t limit);
+    /// Cut d tokens at a out of the state (later ones move down a
+    /// RoPE gap of d); false with err when the span cannot be cut.
+    bool splice_out(int64_t a, int64_t d, std::string& err);
+    /// What a cut's start and length must be a multiple of.
+    int64_t splice_align() const;
     int64_t restorable(int64_t limit) const;
     /// Checkpoint 1 also becomes the anchor (kept until a restore goes before it): the position before the end of the
     /// first prompt of a run that continued in place, where a re-rendered history (earlier reasoning dropped) splits.
