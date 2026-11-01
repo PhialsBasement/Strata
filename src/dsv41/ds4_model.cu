@@ -9405,7 +9405,7 @@ struct Model::Impl {
             cudaSetDevice(devs[di].id);
             cudaStreamSynchronize(devs[di].st);   // (nothing of the run's still reads or writes them: the device's
             cudaStreamSynchronize(c.cs);          // copies done, every read the run issued done - a failed run's too)
-            cudaDeviceSynchronize();              // every stream: a freed buffer read late faults the GPU
+            cudaDeviceSynchronize();              // wait for all streams before freeing
             for (size_t i = c.base; i < c.n_read; ++i)
                 while (fit(c, i).left.load(std::memory_order_acquire) != 0) c.io->wait_any(500);
             if (c.lm_pinned) cudaFreeHost(c.lm_state);
