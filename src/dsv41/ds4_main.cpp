@@ -297,52 +297,43 @@ static bool align_to(const std::vector<int32_t>& ref, const std::vector<int>& id
         for (size_t t = 0; t < K; ++t) h = (h ^ (uint32_t) p[t]) * 1099511628211ull;
         return h;
     };
+    // Each run of ref is found wherever it sits in the prompt (a
+    // prompt the engine reordered last turn comes back in the
+    // client's order); a prompt token is used once, never the last.
     std::unordered_map<uint64_t, std::vector<uint32_t>> at;
-    for (size_t q = c0; q + K <= n - 1; ++q) at[gram(ids.data() + q)].push_back((uint32_t) q);
-    const auto find_at = [&](size_t i, size_t from) -> size_t {   // ref[i..i+K) in ids at >= from
+    for (size_t q = 0; q + K <= n - 1; ++q) at[gram(ids.data() + q)].push_back((uint32_t) q);
+    std::vector<char> used(n, 0);
+    const auto free_run = [&](size_t q) {
+        for (size_t t = q; t < q + K; ++t)
+            if (used[t]) return false;
+        return true;
+    };
+    const auto find_at = [&](size_t i) -> size_t {   // ref[i..i+K) at an unused place
         const auto hit = at.find(gram(ref.data() + i));
         if (hit == at.end()) return SIZE_MAX;
         for (uint32_t q : hit->second)
-            if (q >= from && std::equal(ref.begin() + (long) i, ref.begin() + (long) (i + K), ids.begin() + q)) return q;
+            if (free_run(q) && std::equal(ref.begin() + (long) i, ref.begin() + (long) (i + K), ids.begin() + q))
+                return q;
         return SIZE_MAX;
     };
     al = Align{};
     al.ref_of.assign(n, -1);
-    size_t i = 0, p = 0, run_i = 0, run_p = 0;
-    bool after_change = false;
-    // A short match between two changes is part of the change: a
-    // line's shared start stays with the rest of the changed line.
-    constexpr size_t kMinRun = 64;
-    const auto add_stale = [&](size_t s, size_t len) {
-        if (al.stale.empty() == false && al.stale.back().first + al.stale.back().second == s) al.stale.back().second += len;
-        else al.stale.push_back({s, len});
-    };
-    while (p + 1 < n && i < ref.size()) {
-        if (ref[i] == ids[p]) {
-            al.ref_of[p++] = (int64_t) i++;
+    size_t i = 0, q = 0;   // (q: where the current run continues)
+    while (i < ref.size()) {
+        if (q + 1 < n && used[q] == 0 && ref[i] == ids[q]) {   // (the run goes on)
+            used[q] = 1;
+            al.ref_of[q++] = (int64_t) i++;
             ++al.matched;
             continue;
         }
-        if (i + K > ref.size()) break;
-        size_t i2 = i, q = find_at(i, p + 1);   // (the prompt has new tokens here)
-        if (q == SIZE_MAX) {                     // (ref has tokens the prompt lacks)
+        size_t i2 = i, q2 = i + K <= ref.size() ? find_at(i) : SIZE_MAX;
+        if (q2 == SIZE_MAX)   // (ref has tokens the prompt lacks)
             for (i2 = i + 1; i2 + K <= ref.size() && i2 <= i + kMaxSkip; ++i2)
-                if ((q = find_at(i2, p)) != SIZE_MAX) break;
-        }
-        if (q == SIZE_MAX) break;   // (no match after it: the end, nothing to trim)
-        // without line breaks known, the run before a change gives
-        // up its tail (all of it, if short); whole_lines does better
-        const size_t keep_from = g_newline.empty() == false ? p
-                                 : after_change && i - run_i < kMinRun ? run_p : p - std::min<size_t>(24, p - run_p);
-        for (size_t t = keep_from; t < p; ++t) al.ref_of[t] = -1;
-        al.matched -= p - keep_from;
-        if (p > keep_from) add_stale(i - (p - keep_from), p - keep_from);
-        if (i2 > i) add_stale(i, i2 - i);
-        after_change = true;
+                if ((q2 = find_at(i2)) != SIZE_MAX) break;
+        if (q2 == SIZE_MAX) break;
+        if (i2 > i) al.stale.push_back({i, i2 - i});
         i = i2;
-        p = q;
-        run_i = i;
-        run_p = p;
+        q = q2;
     }
     al.ref_end = i;
     return al.matched >= c0 + 256;
@@ -461,13 +452,21 @@ static void whole_lines(const std::vector<int32_t>& ref, const std::vector<int>&
 // The prompt with its tokens matched to ref[0, upto) first (in ref
 // order), then the rest in their own order.
 static std::vector<int> alike_first(const std::vector<int>& ids, const Align& al, int64_t upto, size_t& n_alike) {
+    std::vector<std::pair<int64_t, int>> early, late;   // (ref position, token)
+    std::vector<int> fresh;
+    for (size_t t = 0; t < ids.size(); ++t) {
+        const int64_t r = al.ref_of[t];
+        if (r < 0) fresh.push_back(ids[t]);
+        else (r < upto ? early : late).push_back({r, ids[t]});
+    }
+    std::sort(early.begin(), early.end());
+    std::sort(late.begin(), late.end());
     std::vector<int> out;
     out.reserve(ids.size());
-    for (size_t t = 0; t < ids.size(); ++t)
-        if (al.ref_of[t] >= 0 && al.ref_of[t] < upto) out.push_back(ids[t]);
+    for (const auto& x : early) out.push_back(x.second);
     n_alike = out.size();
-    for (size_t t = 0; t < ids.size(); ++t)
-        if (al.ref_of[t] >= upto || al.ref_of[t] < 0) out.push_back(ids[t]);
+    for (const auto& x : late) out.push_back(x.second);
+    out.insert(out.end(), fresh.begin(), fresh.end());
     return out;
 }
 
@@ -1056,8 +1055,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     if (ok) {
                         m.checkpoint(3);   // (the next prompt behind this start goes back here)
                         std::vector<int> out(m.tokens().begin(), m.tokens().end());
-                        for (size_t t = 0; t < r.ids.size(); ++t)
-                            if (al.ref_of[t] >= E || al.ref_of[t] < 0) out.push_back(r.ids[t]);
+                        size_t dummy = 0;
+                        const std::vector<int> rest = alike_first(r.ids, al, E, dummy);   // (ref order past E)
+                        out.insert(out.end(), rest.begin() + (long) dummy, rest.end());
                         n_alike = m.tokens().size();
                         r.ids.swap(out);
                         std::fprintf(stderr, "ds4 serve: spliced %lld stale tokens out of a kept conversation; "
