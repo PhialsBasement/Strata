@@ -628,6 +628,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::filesystem::path slot_dir;
     struct Slot {
         std::vector<int32_t> tokens;
+        std::vector<int32_t> client_tokens;          // the prompt as the client sent it (for alignment)
         std::string path;                            // empty: the state is in data (RAM)
         uint64_t bytes = 0, used = 0;
         std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
@@ -747,6 +748,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         slot_trim(path);   // (the folder over its cap: the least recently used conversation goes, not this one)
         return true;
     };
+    // (the client's original prompt for the current request; updated per request, used by slot_put)
+    std::vector<int32_t> last_client_ids;
     // the conversation in the model into a slot (the state is lost otherwise: another one takes the model)
     const auto slot_put = [&](const char* why) {
         if (slot_max <= 0) return;
@@ -765,7 +768,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
             if (slots[i].tokens.size() <= t.size() && std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
                 slot_drop(i);
-        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions()});
+        slots.push_back({t, last_client_ids, "", bytes, ++slot_clock, nullptr, m.check_positions()});
         slots.back().data = buf;
         while (true) {   // past the cap: the least recently used conversation in RAM to the folder, or gone
             int ram = 0, disk = 0;
@@ -897,7 +900,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             uint64_t total = 0;
             for (auto& fd : found) {
                 total += fd.bytes;
-                slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock, nullptr, std::move(fd.cks)});
+                slots.push_back({std::move(fd.toks), {}, fd.bin, fd.bytes, ++slot_clock, nullptr, std::move(fd.cks)});
             }
             std::string msg = "folder " + slot_dir.string() + ": " + std::to_string(slots.size()) +
                               " conversation(s) kept from earlier runs (" + gb(total) + ")";
@@ -974,6 +977,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             m.reset();
             held.clear();
         }
+        // (the client's original prompt, before any reordering)
+        const std::vector<int32_t> client_ids(r.ids.begin(), r.ids.end());
+        last_client_ids = client_ids;
         static const bool reorder_on = [] {
             const char* v = std::getenv("STRATA_DS4_REORDER");
             return v == nullptr || std::atoi(v) != 0;
@@ -982,10 +988,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             long ref_slot = -2;   // (-1: the state in the model)
             Align al;
             int64_t E = -1, best_gain = 0;
-            const auto consider = [&](long k, const std::vector<int32_t>& t, std::vector<int64_t> at_ck) {
+            const auto consider = [&](long k, const std::vector<int32_t>& t,
+                                      const std::vector<int32_t>& ct, std::vector<int64_t> at_ck) {
+                // (use client_tokens to count how many tokens match,
+                // since engine tokens may be reordered; but then
+                // re-align against the engine tokens for the splice)
+                const std::vector<int32_t>& match_ref = ct.empty() ? t : ct;
                 Align a2;
-                if (t.empty() || align_to(t, r.ids, a2) == false) return;
-                whole_lines(t, r.ids, a2, m.splice_align());
+                if (match_ref.empty() || align_to(match_ref, r.ids, a2) == false) return;
+                whole_lines(match_ref, r.ids, a2, m.splice_align());
                 const size_t se = a2.stale.empty() ? 0 : a2.stale.back().first + a2.stale.back().second;
                 at_ck.push_back((int64_t) t.size());
                 int64_t e2 = -1;
@@ -1000,11 +1011,25 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     al = std::move(a2);
                 }
             };
-            consider(-1, m.tokens(), m.check_positions());
-            for (size_t k = 0; k < slots.size(); ++k) consider((long) k, slots[k].tokens, slots[k].cks);
+            consider(-1, m.tokens(), last_client_ids, m.check_positions());
+            for (size_t k = 0; k < slots.size(); ++k) consider((long) k, slots[k].tokens, slots[k].client_tokens, slots[k].cks);
             const std::vector<int32_t>* ref = ref_slot >= 0 ? &slots[(size_t) ref_slot].tokens
                                               : ref_slot == -1 ? &m.tokens() : nullptr;
             if (ref != nullptr) {
+                // (re-align against the engine-order tokens, which is
+                // what slot_load restores and splice_out operates on)
+                Align engine_al;
+                align_to(*ref, r.ids, engine_al);
+                whole_lines(*ref, r.ids, engine_al, m.splice_align());
+                // (use the engine alignment's stale spans and E)
+                const size_t se2 = engine_al.stale.empty() ? 0 : engine_al.stale.back().first + engine_al.stale.back().second;
+                std::vector<int64_t> at_ck2 = ref_slot >= 0 ? slots[(size_t) ref_slot].cks : m.check_positions();
+                at_ck2.push_back((int64_t) ref->size());
+                int64_t E2 = -1;
+                for (int64_t c : at_ck2)
+                    if (c <= (int64_t) engine_al.ref_end && c > (int64_t) se2 && c > E2) E2 = c;
+                al = std::move(engine_al);
+                E = E2;
                 const size_t stale_end = al.stale.empty() ? 0 : al.stale.back().first + al.stale.back().second;
                 (void) stale_end;
                 size_t n_alike = 0;
@@ -1056,76 +1081,23 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             end -= b - a;
                         }
                     }
-                    if (ok == false) {
-                        // (no splice: the model state may be deeply reordered
-                        // from prior splices; drop it and pick the best slot
-                        // whose tokens the prompt shares the most of)
-                        m.reset();
-                        held.clear();
-                        long best_sl = -1;
-                        size_t best_n = 0;
-                        for (size_t k = 0; k < slots.size(); ++k) {
-                            Align a2;
-                            if (align_to(slots[k].tokens, r.ids, a2)) {
-                                whole_lines(slots[k].tokens, r.ids, a2, A);
-                                if (a2.matched > best_n) {
-                                    best_n = a2.matched;
-                                    best_sl = (long) k;
-                                }
-                            }
-                        }
-                        if (best_sl >= 0) {
-                            Slot& sl = slots[(size_t) best_sl];
-                            std::vector<uint8_t> file;
-                            const uint8_t* bytes = nullptr;
-                            size_t nb = 0;
-                            if (sl.data) {
-                                bytes = sl.data->data();
-                                nb = sl.data->size();
-                            } else {
-                                std::ifstream f(sl.path, std::ios::binary);
-                                file.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-                                bytes = file.data();
-                                nb = file.size();
-                            }
-                            std::string le;
-                            if (nb > 0 && m.slot_load(bytes, nb, (int64_t) sl.tokens.size(), le)) {
-                                Align a2;
-                                align_to(sl.tokens, r.ids, a2);
-                                whole_lines(sl.tokens, r.ids, a2, A);
-                                int64_t upto = (int64_t) sl.tokens.size();
-                                // (find the latest checkpoint at or before the first stale span)
-                                if (a2.stale.empty() == false) {
-                                    int64_t limit = (int64_t) a2.stale.front().first;
-                                    int64_t rs = m.restorable(limit);
-                                    if (rs > 0 && m.restore(rs)) upto = m.pos();
-                                    else upto = (int64_t) sl.tokens.size();
-                                }
-                                r.ids = alike_first(r.ids, a2, upto, n_alike);
-                                // (verify: does the reordered prompt actually
-                                // start with the state's tokens?)
-                                const auto& vst = m.tokens();
-                                size_t vc = 0;
-                                while (vc < (size_t) m.pos() && vc < r.ids.size() && vst[vc] == r.ids[vc]) ++vc;
-                                if (vc < n_alike && vc < (size_t) m.pos()) {
-                                    // (the reordered prompt diverges: restore to
-                                    // where they agree and read from there)
-                                    int64_t rs = m.restorable((int64_t) vc);
-                                    if (rs > 0 && m.restore(rs)) n_alike = (size_t) m.pos();
-                                    else {
-                                        m.reset();
-                                        n_alike = 0;
-                                    }
-                                }
-                                std::fprintf(stderr, "ds4 serve: no splice (%s); fell back to slot with "
-                                             "%zu tokens, reused %zu, %zu to read\n", e.c_str(),
-                                             sl.tokens.size(), n_alike, r.ids.size() - n_alike);
-                            } else {
-                                std::fprintf(stderr, "ds4 serve: no splice (%s); slot load failed (%s)\n",
-                                             e.c_str(), le.c_str());
-                            }
+                    if (ok == false && al.stale.empty() == false) {
+                        // (the splice can't cut near the end; the state is
+                        // already loaded in engine order; restore to the
+                        // checkpoint before the first stale span and reorder
+                        // the prompt to match what's kept)
+                        int64_t limit = (int64_t) al.stale.front().first;
+                        int64_t rs = m.restorable(limit);
+                        if (rs > 0 && m.restore(rs)) {
+                            r.ids = alike_first(r.ids, al, m.pos(), n_alike);
+                            std::fprintf(stderr, "ds4 serve: no splice (%s); restored to %lld, "
+                                         "reused %zu, %zu to read\n", e.c_str(), (long long) m.pos(),
+                                         n_alike, r.ids.size() - n_alike);
                         } else {
-                            std::fprintf(stderr, "ds4 serve: no splice (%s); no usable slot found\n", e.c_str());
+                            r.ids = alike_first(r.ids, al, E, n_alike);
+                            std::fprintf(stderr, "ds4 serve: no splice (%s); no checkpoint before "
+                                         "stale span, reused %zu, %zu to read\n", e.c_str(),
+                                         n_alike, r.ids.size() - n_alike);
                         }
                         e = "handled";
                     }
