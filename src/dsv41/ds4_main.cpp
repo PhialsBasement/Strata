@@ -1043,6 +1043,34 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     }
                     if (ok && E < m.pos()) ok = m.restore(E) && m.pos() == E;
                     const int64_t A = m.splice_align();
+                    {   // every cut must leave a window of kept tokens after it
+                        int64_t end = E;   // (cuts go last first, so the state shrinks)
+                        for (size_t k = al.stale.size(); ok && k-- > 0;) {
+                            const int64_t a = ((int64_t) al.stale[k].first + A - 1) / A * A;
+                            const int64_t b = ((int64_t) (al.stale[k].first + al.stale[k].second)) / A * A;
+                            if (b <= a) continue;
+                            if (b + m.splice_window() > end) {
+                                ok = false;
+                                e = "a stale span ends too close to the kept end";
+                            }
+                            end -= b - a;
+                        }
+                    }
+                    if (ok == false && m.tokens().empty() == false && al.stale.empty() == false) {
+                        // (no splice: resume at the checkpoint before the first stale span)
+                        const int64_t first = (int64_t) al.stale.front().first;
+                        if (m.restore(first) && m.pos() > 0) {
+                            size_t na = 0;
+                            std::vector<int> ids = alike_first(r.ids, al, m.pos(), na);
+                            if (na == (size_t) m.pos()) {   // (the prompt starts with the kept state exactly)
+                                std::fprintf(stderr, "ds4 serve: no splice (%s); resuming at token %zu before the "
+                                             "stale span, %zu to read\n", e.c_str(), na, ids.size() - na);
+                                r.ids.swap(ids);
+                                n_alike = na;
+                                e = "handled";
+                            }
+                        }
+                    }
                     int64_t cut = 0;
                     for (size_t k = al.stale.size(); ok && k-- > 0;) {   // (last first: earlier spans keep their place)
                         const int64_t a = ((int64_t) al.stale[k].first + A - 1) / A * A;
@@ -1062,7 +1090,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         r.ids.swap(out);
                         std::fprintf(stderr, "ds4 serve: spliced %lld stale tokens out of a kept conversation; "
                                      "%zu tokens reused, %zu to read\n", (long long) cut, n_alike, r.ids.size() - n_alike);
-                    } else {
+                    } else if (e != "handled") {
                         std::fprintf(stderr, "ds4 serve: splice failed (%s) - reading the prompt again\n", e.c_str());
                         m.reset();
                         held.clear();

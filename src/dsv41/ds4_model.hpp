@@ -170,6 +170,8 @@ public:
     bool splice_out(int64_t a, int64_t d, std::string& err);
     /// What a cut's start and length must be a multiple of.
     int64_t splice_align() const;
+    /// Tokens a cut must leave after it (the window ring's length).
+    int64_t splice_window() const;
     int64_t restorable(int64_t limit) const;
     /// Checkpoint 1 also becomes the anchor (kept until a restore goes before it): the position before the end of the
     /// first prompt of a run that continued in place, where a re-rendered history (earlier reasoning dropped) splits.

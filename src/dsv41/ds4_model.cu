@@ -10936,6 +10936,7 @@ void Model::reset() { p_->reset(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
 bool Model::splice_out(int64_t a, int64_t d, std::string& err) { return p_->splice_out(a, d, err); }
+int64_t Model::splice_window() const { return p_->g.win; }
 int64_t Model::splice_align() const {
     int64_t align = 1;
     for (int r : p_->g.ratios) align = std::lcm(align, (int64_t) std::max(1, r));
