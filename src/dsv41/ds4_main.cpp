@@ -1057,10 +1057,26 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         }
                     }
                     if (ok == false && m.tokens().empty() == false) {
-                        // (no splice: keep the state as it is; reorder the prompt so
-                        // the alike part comes first; the normal prefix match below
-                        // picks up from however far the state agrees with the prompt)
-                        r.ids = alike_first(r.ids, al, (int64_t) m.tokens().size(), n_alike);
+                        // (no splice: keep the state as it is; rebuild the prompt
+                        // so it starts with the model's actual tokens, then the rest)
+                        const auto& st = m.tokens();
+                        std::vector<char> used(r.ids.size(), 0);
+                        size_t p = 0;
+                        for (size_t s = 0; s < (size_t) m.pos() && p < r.ids.size(); ++s) {
+                            while (p < r.ids.size() && (used[p] || r.ids[p] != st[s])) ++p;
+                            if (p < r.ids.size()) {
+                                used[p] = 1;
+                                ++p;
+                            }
+                        }
+                        std::vector<int> out;
+                        out.reserve(r.ids.size());
+                        for (size_t t = 0; t < r.ids.size(); ++t)
+                            if (used[t]) out.push_back(r.ids[t]);
+                        n_alike = out.size();
+                        for (size_t t = 0; t < r.ids.size(); ++t)
+                            if (used[t] == 0) out.push_back(r.ids[t]);
+                        r.ids.swap(out);
                         std::fprintf(stderr, "ds4 serve: no splice (%s); keeping %zu tokens of state, "
                                      "reordered prompt has %zu alike + %zu new\n", e.c_str(),
                                      m.tokens().size(), n_alike, r.ids.size() - n_alike);
