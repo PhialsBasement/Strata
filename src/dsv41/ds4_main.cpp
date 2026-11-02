@@ -1056,20 +1056,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             end -= b - a;
                         }
                     }
-                    if (ok == false && m.tokens().empty() == false && al.stale.empty() == false) {
-                        // (no splice: resume at the checkpoint before the first stale span)
-                        const int64_t first = (int64_t) al.stale.front().first;
-                        if (m.restore(first) && m.pos() > 0) {
-                            size_t na = 0;
-                            std::vector<int> ids = alike_first(r.ids, al, m.pos(), na);
-                            if (na == (size_t) m.pos()) {   // (the prompt starts with the kept state exactly)
-                                std::fprintf(stderr, "ds4 serve: no splice (%s); resuming at token %zu before the "
-                                             "stale span, %zu to read\n", e.c_str(), na, ids.size() - na);
-                                r.ids.swap(ids);
-                                n_alike = na;
-                                e = "handled";
-                            }
-                        }
+                    if (ok == false && m.tokens().empty() == false) {
+                        // (no splice: keep the state as it is; reorder the prompt so
+                        // the alike part comes first; the normal prefix match below
+                        // picks up from however far the state agrees with the prompt)
+                        r.ids = alike_first(r.ids, al, (int64_t) m.tokens().size(), n_alike);
+                        std::fprintf(stderr, "ds4 serve: no splice (%s); keeping %zu tokens of state, "
+                                     "reordered prompt has %zu alike + %zu new\n", e.c_str(),
+                                     m.tokens().size(), n_alike, r.ids.size() - n_alike);
+                        e = "handled";
                     }
                     int64_t cut = 0;
                     for (size_t k = al.stale.size(); ok && k-- > 0;) {   // (last first: earlier spans keep their place)
