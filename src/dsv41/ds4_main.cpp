@@ -1102,6 +1102,21 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                     else upto = (int64_t) sl.tokens.size();
                                 }
                                 r.ids = alike_first(r.ids, a2, upto, n_alike);
+                                // (verify: does the reordered prompt actually
+                                // start with the state's tokens?)
+                                const auto& vst = m.tokens();
+                                size_t vc = 0;
+                                while (vc < (size_t) m.pos() && vc < r.ids.size() && vst[vc] == r.ids[vc]) ++vc;
+                                if (vc < n_alike && vc < (size_t) m.pos()) {
+                                    // (the reordered prompt diverges: restore to
+                                    // where they agree and read from there)
+                                    int64_t rs = m.restorable((int64_t) vc);
+                                    if (rs > 0 && m.restore(rs)) n_alike = (size_t) m.pos();
+                                    else {
+                                        m.reset();
+                                        n_alike = 0;
+                                    }
+                                }
                                 std::fprintf(stderr, "ds4 serve: no splice (%s); fell back to slot with "
                                              "%zu tokens, reused %zu, %zu to read\n", e.c_str(),
                                              sl.tokens.size(), n_alike, r.ids.size() - n_alike);
