@@ -990,13 +990,15 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             int64_t E = -1, best_gain = 0;
             const auto consider = [&](long k, const std::vector<int32_t>& t,
                                       const std::vector<int32_t>& ct, std::vector<int64_t> at_ck) {
-                // (use client_tokens to count how many tokens match,
-                // since engine tokens may be reordered; but then
-                // re-align against the engine tokens for the splice)
-                const std::vector<int32_t>& match_ref = ct.empty() ? t : ct;
-                Align a2;
-                if (match_ref.empty() || align_to(match_ref, r.ids, a2) == false) return;
-                whole_lines(match_ref, r.ids, a2, m.splice_align());
+                // (try both engine tokens and client tokens; take
+                // whichever aligns more of the prompt)
+                Align a2, ac;
+                bool have_t = t.empty() == false && align_to(t, r.ids, a2);
+                if (have_t) whole_lines(t, r.ids, a2, m.splice_align());
+                bool have_c = ct.empty() == false && align_to(ct, r.ids, ac);
+                if (have_c) whole_lines(ct, r.ids, ac, m.splice_align());
+                if (have_c && (!have_t || ac.matched > a2.matched)) a2 = std::move(ac);
+                if (have_t == false && have_c == false) return;
                 const size_t se = a2.stale.empty() ? 0 : a2.stale.back().first + a2.stale.back().second;
                 at_ck.push_back((int64_t) t.size());
                 int64_t e2 = -1;
