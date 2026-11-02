@@ -1056,6 +1056,10 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         std::fprintf(stderr, "ds4 try: ref %zu C %lld ref_end %zu\n", t.size(), (long long) C,
                                      a2.ref_end);
                     if (C < 256 || C > (int64_t) a2.ref_end) continue;
+                    // (the kept part ends on a line boundary: moved
+                    // lines read after it start a line of their own)
+                    const int last_tok = t[(size_t) C - 1];
+                    if (is_nl_tok(last_tok) == false && is_mark(last_tok) == false) continue;
                     int64_t end = C, cut = 0;
                     bool ok = true;
                     // (the model must read the client's turn markers in

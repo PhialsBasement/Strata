@@ -766,6 +766,10 @@ struct Layer {
           *gate_bias_vl = nullptr;   // (the image tokens' routing bias, with the vision tower)
     float* res_bias = nullptr;          // prompt routing bias: resident only
     std::vector<float> h_gate_bias, h_res_bias;
+    float* tie_bias = nullptr;          // DS4_TIE_PEN: near-ties to resident
+    float* h_tie_bias = nullptr;        // (pinned: copied without a sync)
+    cudaEvent_t tie_ev = nullptr;       // (that copy done: the buffer is free)
+    int64_t tie_at = -1;                // (the token count it was made at)
     uint16_t* i_wproj = nullptr;
     float* gate_w = nullptr;   // the router's weights, F32 (DeepSeek's inference computes the gate in F32)
     uint8_t* win = nullptr;                     // [win] rows of kKvFp8 (kv_row_bytes)
@@ -1217,18 +1221,69 @@ struct Model::Impl {
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
     size_t zc_stride = 0;
     bool zc_copy = true;               // DS4_STORE_STAGE=0: the expert kernels read the arena over PCIe themselves
-    // STRATA_DS4_PROMPT_RESIDENT (1 = on, 0 = off): while a prompt
-    // is read, tokens pick only experts in VRAM or RAM (no disk
-    // reads); the reply's tokens route as the model was trained
+    // STRATA_DS4_PROMPT_RESIDENT=1 (off by default): prompt tokens
+    // pick only resident experts.  Measured: PPL +146%, top-1 67%;
+    // use DS4_TIE_PEN (0.3: top-1 93%, about as fast) instead
     const bool prompt_resident = [] {
         const char* v = std::getenv("STRATA_DS4_PROMPT_RESIDENT");
-        return v == nullptr || std::atoi(v) != 0;
+        return v != nullptr && std::atoi(v) != 0;
     }();
     bool prompt_feed = false;   // (feed / feed_mark: a prompt is read)
     bool resident(const Layer& l, int e) const {
         if (l.slot.empty() == false && l.slot[(size_t) e] >= 0) return true;
         if (store && store->find(l.il, e) >= 0) return true;
         return in_ram(l, e);
+    }
+    // DS4_TIE_PEN=d: a non-resident expert's selection score less d,
+    // so it loses only a near-tie (weights stay the router's own);
+    // the resident set is looked at every 16 tokens.  0: off
+    const float tie_pen = [] {
+        const char* v = std::getenv("DS4_TIE_PEN");
+        return v ? (float) std::atof(v) : 0.0f;
+    }();
+    const float* tie_bias(Dev& d, Layer& l, cudaStream_t s) {
+        if (tie_pen <= 0.0f || l.gate_bias == nullptr || l.mtp) return nullptr;
+        if (l.tie_bias != nullptr && l.tie_at >= 0 && st.tokens - l.tie_at < 16) return l.tie_bias;
+        const size_t n = (size_t) l.n_exp;
+        std::string err;
+        if (l.tie_bias == nullptr && dalloc(d, l.tie_bias, n, err) == false) return nullptr;
+        if (l.h_gate_bias.size() != n) {
+            l.h_gate_bias.resize(n);
+            if (cudaMemcpy(l.h_gate_bias.data(), l.gate_bias, n * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                l.h_gate_bias.clear();
+                return nullptr;
+            }
+        }
+        if (l.h_tie_bias == nullptr) {
+            if (cudaMallocHost((void**) &l.h_tie_bias, n * 4) != cudaSuccess ||
+                cudaEventCreateWithFlags(&l.tie_ev, cudaEventDisableTiming) != cudaSuccess) {
+                l.h_tie_bias = nullptr;
+                return nullptr;
+            }
+        } else if (cudaEventQuery(l.tie_ev) != cudaSuccess) {
+            return l.tie_bias;   // (the last copy still reads the buffer)
+        }
+        const Layer& lead = L[(size_t) l.il];
+        // (with a store, resident means a VRAM or store slot: no page
+        // cache probe, mincore a matrix was ~10 ms a token)
+        const auto here = [&](int e) {
+            if (lead.slot.empty() == false && lead.slot[(size_t) e] >= 0) return true;
+            if (store) return store->find(lead.il, e) >= 0;
+            return in_ram(lead, e);
+        };
+        for (size_t e = 0; e < n; ++e)
+            l.h_tie_bias[e] = l.h_gate_bias[e] - (here((int) e) ? 0.0f : tie_pen);
+        // (stream order: the router below reads it after the copy)
+        if (cudaMemcpyAsync(l.tie_bias, l.h_tie_bias, n * 4, cudaMemcpyHostToDevice, s) != cudaSuccess ||
+            cudaEventRecord(l.tie_ev, s) != cudaSuccess)
+            return nullptr;
+        l.tie_at = st.tokens;
+        return l.tie_bias;
+    }
+    // either routing bias for this layer now (null: the router's own)
+    const float* route_bias(Dev& d, Layer& l, cudaStream_t s) {
+        const float* b = prompt_feed ? resident_bias(d, l, s) : nullptr;
+        return b != nullptr ? b : tie_bias(d, l, s);
     }
     // the bias that keeps a prompt's routing on resident experts,
     // into l.res_bias (null when it cannot be had: route as usual)
@@ -8545,6 +8600,7 @@ struct Model::Impl {
         x3::rows_f16(c.x, D, nullptr, T, D, c.x16, s);
         gemv_f32(l.gate_w, c.x, l.n_exp, D, T, c.glog, 1024, s);   // (F32 x: the token path's bits)
         const float* rbias = resident_bias(d, l, s);
+        if (rbias == nullptr) rbias = tie_bias(d, l, s);
         for (int r0 = 0; r0 < T; r0 += kVlRows) {   // (route()'s image bits cover kVlRows rows a call)
             const int nr = std::min(kVlRows, T - r0);
             VlBits vb;
@@ -10511,11 +10567,11 @@ struct Model::Impl {
                 float* gl = d.glog_a + (size_t) (a - 1) * kWin * 1024;
                 gemv_f32(nx->gate_w, d.x, nx->n_exp, D, T, gl, 1024, s);   // (normed with the next layer's FFN
                                                                          // weights instead: the same hit rate)
-                const float* nb = prompt_feed ? resident_bias(d, const_cast<Layer&>(*nx), s) : nullptr;
+                const float* nb = route_bias(d, const_cast<Layer&>(*nx), s);
                 route_ahead(gl, nb != nullptr ? nb : nx->gate_bias, nx->n_exp, m, T, reqs + slot, (a - 1) * kAhead1, s);
                 na[a - 1] = m;
             }
-            const float* wb = prompt_feed ? resident_bias(d, l, s) : nullptr;
+            const float* wb = route_bias(d, l, s);
             route_publish(d.glog, wb != nullptr ? wb : l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, l.vram_tab, d.x, D, d.ridx, d.rw,
                           d.plan_ptr, lead ? reqs + slot : nullptr, sq, s, l.gate_bias_vl, l.mtp ? 0u : wp.vl, na[0],
                           na[1]);
@@ -10620,7 +10676,7 @@ struct Model::Impl {
         gemv_f32(l.gate_w, d.x, l.n_exp, D, T, d.glog, 1024, s);
         VlBits vb = {};
         vb.w[0] = l.mtp ? 0u : wp.vl;
-        const float* hb = prompt_feed ? resident_bias(d, l, s) : nullptr;
+        const float* hb = route_bias(d, l, s);
         route(d.glog, hb != nullptr ? hb : l.gate_bias, l.n_exp, l.k_exp, T, g.route_scale, d.ridx, d.rw, s, l.gate_bias_vl,
               vb.w[0] != 0 ? &vb : nullptr);
         CK(cudaMemcpyAsync(h_idx, d.ridx, (size_t) T * kPicks * 4, cudaMemcpyDeviceToHost, s));
