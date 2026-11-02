@@ -1104,6 +1104,12 @@ struct Model::Impl {
         std::vector<std::vector<float>> comp;
     };
     static constexpr int kChecks = 4;
+    // earlier turn boundaries, by position (DS4_CK_KEEP: how many)
+    std::vector<Check> hist;
+    size_t hist_max = [] {
+        const char* v = std::getenv("DS4_CK_KEEP");
+        return v ? (size_t) std::max(0, std::atoi(v)) : (size_t) 48;
+    }();
     Check ck[kChecks];                // the end of the last prompt, the position before it, the anchor (the position
                                       // before the end of the first prompt of the run of prompts that each continued
                                       // the last in place: a chat template that drops earlier turns' reasoning at a new
@@ -5723,6 +5729,7 @@ struct Model::Impl {
         cuts.clear();
         rope_off = 0;
         for (Check& c0 : ck) c0.pos = -1;
+        hist.clear();
         for (Layer& l0 : L)
             for (int m = 0; m < l0.nm; ++m) {
                 Layer& l = member(l0, m);
@@ -5740,8 +5747,31 @@ struct Model::Impl {
 
     // the state at pos into checkpoint `slot` (the window rings and the compressors' partial groups: the rest of the
     // state is indexed by position, and what lies past a restored position is written again)
-    void checkpoint(int slot) {
-        Check& c = ck[slot & (kChecks - 1)];
+    void checkpoint(int slot) { fill(ck[slot & (kChecks - 1)]); }
+    // the state at pos into the history (the evenly spread ones stay)
+    void mark() {
+        if (hist_max == 0 || pos <= 0) return;
+        for (const Check& h : hist)
+            if (h.pos == pos) return;
+        Check c;
+        fill(c);
+        hist.push_back(std::move(c));
+        std::sort(hist.begin(), hist.end(), [](const Check& a, const Check& b) { return a.pos < b.pos; });
+        while (hist.size() > hist_max && hist.size() > 2) {   // (drop the one whose loss leaves the smallest gap)
+            size_t best = 1;
+            for (size_t i = 2; i + 1 < hist.size(); ++i)
+                if (hist[i + 1].pos - hist[i - 1].pos < hist[best + 1].pos - hist[best - 1].pos) best = i;
+            hist.erase(hist.begin() + (long) best);
+        }
+    }
+    std::vector<int64_t> live_positions() const {
+        std::vector<int64_t> v = check_positions();
+        for (const Check& h : hist)
+            if (h.pos > 0 && h.pos <= pos && std::find(v.begin(), v.end(), h.pos) == v.end()) v.push_back(h.pos);
+        std::sort(v.rbegin(), v.rend());
+        return v;
+    }
+    void fill(Check& c) {
         c.pos = pos;
         c.win.resize(L.size());
         c.comp.resize(L.size() * 2);
@@ -5766,15 +5796,19 @@ struct Model::Impl {
     }
 
     // the checkpoint at or before position limit (the state's tokens agree with a new prompt up to there), or -1
-    int best_check(int64_t limit) const {
-        int b = -1;
-        for (int i = 0; i < kChecks; ++i)
-            if (ck[i].pos >= 0 && ck[i].pos <= limit && ck[i].pos <= pos && (b < 0 || ck[i].pos > ck[b].pos)) b = i;
+    const Check* best_check(int64_t limit) const {
+        const Check* b = nullptr;
+        const auto see = [&](const Check& c) {
+            if (c.pos >= 0 && c.pos <= limit && c.pos <= pos && c.win.size() == L.size() && (b == nullptr || c.pos > b->pos))
+                b = &c;
+        };
+        for (const Check& c : ck) see(c);
+        for (const Check& c : hist) see(c);
         return b;
     }
     int64_t restorable(int64_t limit) const {
-        const int b = best_check(limit);
-        return b < 0 ? -1 : ck[b].pos;
+        const Check* b = best_check(limit);
+        return b == nullptr ? -1 : b->pos;
     }
 
     // checkpoint 1 (the position before the last prompt's end) becomes the anchor too
@@ -5805,9 +5839,9 @@ struct Model::Impl {
     }
 
     bool restore(int64_t limit) {
-        const int b = best_check(limit);
-        if (b < 0) return false;
-        const Check& c = ck[b];
+        const Check* b = best_check(limit);
+        if (b == nullptr) return false;
+        const Check& c = *b;
         for (size_t i = 0; i < L.size(); ++i)
             for (int m = 0; m < L[i].nm; ++m) {   // (a group's members hold the same state: the lead's copy)
                 Layer& l = member(L[i], m);
@@ -5830,6 +5864,7 @@ struct Model::Impl {
         slot_held = false;
         for (Check& o2 : ck)   // a later checkpoint saw tokens the state no longer has
             if (o2.pos > pos) o2.pos = -1;
+        hist.erase(std::remove_if(hist.begin(), hist.end(), [&](const Check& h) { return h.pos > pos; }), hist.end());
         while (cuts.empty() == false && cuts.back().first >= pos) cuts.pop_back();
         rope_off = cuts.empty() ? 0 : cuts.back().second;
         return true;
@@ -5900,6 +5935,8 @@ struct Model::Impl {
         ctoks.erase(ctoks.begin() + a, ctoks.begin() + a + d);
         pos -= d;
         for (Check& c0 : ck) c0.pos = -1;
+        // (one at or before the cut saw none of it: still good)
+        hist.erase(std::remove_if(hist.begin(), hist.end(), [&](const Check& h) { return h.pos > a; }), hist.end());
         slot_held = false;
         return true;
     }
@@ -6266,6 +6303,7 @@ struct Model::Impl {
             ctoks[i] = toks[i] < pk.eg_vocab ? pk.eg_map[(size_t) toks[i]] : 0;
         for (int k = 0; k < kChecks; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
                                                                // this one replaced)
+        hist.clear();
         slot_held = false;
         ok = true;
         return true;
@@ -10944,6 +10982,8 @@ int64_t Model::splice_align() const {
 }
 void Model::pin() { p_->pin(); }
 std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
+std::vector<int64_t> Model::live_positions() const { return p_->live_positions(); }
+void Model::mark() { p_->mark(); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }
 uint64_t Model::slot_save(std::vector<uint8_t>& out, std::string& err) { return p_->slot_save(out, err); }
 bool Model::slot_load(const uint8_t* data, size_t bytes, int64_t n_pos, std::string& err) {

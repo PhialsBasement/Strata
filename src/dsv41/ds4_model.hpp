@@ -178,6 +178,10 @@ public:
     void pin();
     /// The positions restore() can go back to, latest first (a slot keeps them: it can be taken back at any of them).
     std::vector<int64_t> check_positions() const;
+    /// Those plus the history mark() keeps (the live state only).
+    std::vector<int64_t> live_positions() const;
+    /// Keep the state at the current position in the history.
+    void mark();
 
     /// The conversation in the model into `out` (slot_save): its position, its tokens, every window ring (the DSpark
     /// blocks' included), the compressors' partial groups and each KV source's compressed KV and index keys up to it,

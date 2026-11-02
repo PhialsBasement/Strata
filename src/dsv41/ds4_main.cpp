@@ -276,6 +276,10 @@ bool round(strata::ds4::Model& m, int tok, int room, bool spec, float conf_min, 
 
 // The pack's line-break tokens (vocab.json keys holding a newline).
 static std::vector<char> g_newline;
+// Turn markers (keys with a full-width bar, think and tool tags).
+static std::vector<char> g_mark;
+static bool is_mark(int t) { return t >= 0 && (size_t) t < g_mark.size() && g_mark[(size_t) t]; }
+static bool is_nl_tok(int t) { return t >= 0 && (size_t) t < g_newline.size() && g_newline[(size_t) t]; }
 
 // How a prompt lines up with a kept conversation `ref`: for each
 // prompt token the ref position it matches (-1: new), the ref spans
@@ -316,6 +320,41 @@ static bool align_to(const std::vector<int32_t>& ref, const std::vector<int>& id
                 return q;
         return SIZE_MAX;
     };
+    // (a whole line shorter than a run is found by its tokens)
+    const auto ends = [](const auto& v, size_t b) {
+        return is_nl_tok(v[b]) || is_mark(v[b]) || (b + 1 < v.size() && is_mark(v[b + 1]));
+    };
+    const auto span_hash = [](const auto* p, size_t len) {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t t = 0; t < len; ++t) h = (h ^ (uint32_t) p[t]) * 1099511628211ull;
+        return h ^ len;
+    };
+    std::unordered_map<uint64_t, std::vector<uint32_t>> line_at;
+    for (size_t a = 0; a + 1 < n;) {
+        size_t b = a;
+        while (b + 1 < n && ends(ids, b) == false) ++b;
+        if (b + 1 < n && b - a + 1 >= 4) line_at[span_hash(ids.data() + a, b - a + 1)].push_back((uint32_t) a);
+        a = b + 1;
+    }
+    const auto find_line = [&](size_t i) -> size_t {   // ref's line at i at an unused place
+        if (i != 0 && ends(ref, i - 1) == false) return SIZE_MAX;
+        size_t j = i;
+        while (j + 1 < ref.size() && ends(ref, j) == false) ++j;
+        const size_t len = j - i + 1;
+        if (len < 4) return SIZE_MAX;
+        const auto hit = line_at.find(span_hash(ref.data() + i, len));
+        if (hit == line_at.end()) return SIZE_MAX;
+        for (uint32_t q0 : hit->second) {
+            bool ok = q0 + len < n;
+            for (size_t t = 0; ok && t < len; ++t) ok = used[q0 + t] == 0 && ids[q0 + t] == ref[i + t];
+            if (ok) return q0;
+        }
+        return SIZE_MAX;
+    };
+    const auto find_any = [&](size_t i) -> size_t {
+        const size_t g = i + K <= ref.size() ? find_at(i) : SIZE_MAX;
+        return g != SIZE_MAX ? g : find_line(i);
+    };
     al = Align{};
     al.ref_of.assign(n, -1);
     size_t i = 0, q = 0;   // (q: where the current run continues)
@@ -326,10 +365,10 @@ static bool align_to(const std::vector<int32_t>& ref, const std::vector<int>& id
             ++al.matched;
             continue;
         }
-        size_t i2 = i, q2 = i + K <= ref.size() ? find_at(i) : SIZE_MAX;
+        size_t i2 = i, q2 = find_any(i);
         if (q2 == SIZE_MAX)   // (ref has tokens the prompt lacks)
-            for (i2 = i + 1; i2 + K <= ref.size() && i2 <= i + kMaxSkip; ++i2)
-                if ((q2 = find_at(i2)) != SIZE_MAX) break;
+            for (i2 = i + 1; i2 < ref.size() && i2 <= i + kMaxSkip; ++i2)
+                if ((q2 = find_any(i2)) != SIZE_MAX) break;
         if (q2 == SIZE_MAX) break;
         if (i2 > i) al.stale.push_back({i, i2 - i});
         i = i2;
@@ -364,6 +403,14 @@ static void load_newlines(const std::string& pack) {
         if (id >= 0 && id < (1 << 24)) {
             if ((size_t) id >= g_newline.size()) g_newline.resize((size_t) id + 1, 0);
             if (nl) g_newline[(size_t) id] = 1;
+            const std::string key = s.substr(i + 1, j - i - 1);
+            const bool bar = key.find("\xEF\xBD\x9C") != std::string::npos ||
+                             key.find("\\uff5c") != std::string::npos || key.find("\\uFF5C") != std::string::npos;
+            const bool tag = key == "<think>" || key == "</think>" || key == "<tool_result>" || key == "</tool_result>";
+            if (bar || tag) {
+                if ((size_t) id >= g_mark.size()) g_mark.resize((size_t) id + 1, 0);
+                g_mark[(size_t) id] = 1;
+            }
         }
         i = k;
     }
@@ -375,6 +422,10 @@ static void load_newlines(const std::string& pack) {
 static void whole_lines(const std::vector<int32_t>& ref, const std::vector<int>& ids, Align& al, int64_t align) {
     const auto is_nl = [](int t) { return t >= 0 && (size_t) t < g_newline.size() && g_newline[(size_t) t]; };
     if (g_newline.empty()) return;
+    // (a line ends at a newline; a marker is a line of its own)
+    const auto ends_at = [&](const auto& v, size_t b) {
+        return is_nl(v[b]) || is_mark(v[b]) || (b + 1 < v.size() && is_mark(v[b + 1]));
+    };
     const size_t R = al.ref_end, n = ids.size();
     std::vector<char> st(R, 0);
     for (const auto& s : al.stale)
@@ -395,7 +446,7 @@ static void whole_lines(const std::vector<int32_t>& ref, const std::vector<int>&
         changed = false;
         for (size_t a = 0; a <= tmax;) {   // (prompt lines with a new token)
             size_t b = a;
-            while (b < n - 1 && is_nl(ids[b]) == false) ++b;
+            while (b < n - 1 && ends_at(ids, b) == false) ++b;
             if (b <= tmax) {
                 bool any_new = false, any_old = false;
                 for (size_t t = a; t <= b; ++t) (al.ref_of[t] < 0 ? any_new : any_old) = true;
@@ -409,7 +460,7 @@ static void whole_lines(const std::vector<int32_t>& ref, const std::vector<int>&
         }
         for (size_t a = 0; a < R;) {   // (ref lines with a stale token)
             size_t b = a;
-            while (b < ref.size() - 1 && is_nl(ref[b]) == false) ++b;
+            while (b < ref.size() - 1 && ends_at(ref, b) == false) ++b;
             if (b < R) {
                 bool any_st = false, any_ok = false;
                 for (size_t k = a; k <= b; ++k) (st[k] ? any_st : any_ok) = true;
@@ -628,7 +679,6 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
     std::filesystem::path slot_dir;
     struct Slot {
         std::vector<int32_t> tokens;
-        std::vector<int32_t> client_tokens;          // the prompt as the client sent it (for alignment)
         std::string path;                            // empty: the state is in data (RAM)
         uint64_t bytes = 0, used = 0;
         std::shared_ptr<std::vector<uint8_t>> data;   // the RAM slot's bytes (null: a file slot)
@@ -748,8 +798,6 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         slot_trim(path);   // (the folder over its cap: the least recently used conversation goes, not this one)
         return true;
     };
-    // (the client's original prompt for the current request; updated per request, used by slot_put)
-    std::vector<int32_t> last_client_ids;
     // the conversation in the model into a slot (the state is lost otherwise: another one takes the model)
     const auto slot_put = [&](const char* why) {
         if (slot_max <= 0) return;
@@ -768,7 +816,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
             if (slots[i].tokens.size() <= t.size() && std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
                 slot_drop(i);
-        slots.push_back({t, last_client_ids, "", bytes, ++slot_clock, nullptr, m.check_positions()});
+        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions()});
         slots.back().data = buf;
         while (true) {   // past the cap: the least recently used conversation in RAM to the folder, or gone
             int ram = 0, disk = 0;
@@ -900,7 +948,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             uint64_t total = 0;
             for (auto& fd : found) {
                 total += fd.bytes;
-                slots.push_back({std::move(fd.toks), {}, fd.bin, fd.bytes, ++slot_clock, nullptr, std::move(fd.cks)});
+                slots.push_back({std::move(fd.toks), fd.bin, fd.bytes, ++slot_clock, nullptr, std::move(fd.cks)});
             }
             std::string msg = "folder " + slot_dir.string() + ": " + std::to_string(slots.size()) +
                               " conversation(s) kept from earlier runs (" + gb(total) + ")";
@@ -977,9 +1025,13 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             m.reset();
             held.clear();
         }
-        // (the client's original prompt, before any reordering)
-        const std::vector<int32_t> client_ids(r.ids.begin(), r.ids.end());
-        last_client_ids = client_ids;
+        if (const char* dump = std::getenv("DS4_DUMP_IDS")) {
+            // (debug: the client's prompt and the model's state)
+            std::ofstream f(std::string(dump) + ".client", std::ios::binary | std::ios::trunc);
+            f.write((const char*) r.ids.data(), (std::streamsize) (r.ids.size() * sizeof(int)));
+            std::ofstream g(std::string(dump) + ".state", std::ios::binary | std::ios::trunc);
+            g.write((const char*) m.tokens().data(), (std::streamsize) (m.tokens().size() * sizeof(int32_t)));
+        }
         static const bool reorder_on = [] {
             const char* v = std::getenv("STRATA_DS4_REORDER");
             return v == nullptr || std::atoi(v) != 0;
@@ -988,52 +1040,102 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             long ref_slot = -2;   // (-1: the state in the model)
             Align al;
             int64_t E = -1, best_gain = 0;
-            const auto consider = [&](long k, const std::vector<int32_t>& t,
-                                      const std::vector<int32_t>& ct, std::vector<int64_t> at_ck) {
-                // (try both engine tokens and client tokens; take
-                // whichever aligns more of the prompt)
-                Align a2, ac;
-                bool have_t = t.empty() == false && align_to(t, r.ids, a2);
-                if (have_t) whole_lines(t, r.ids, a2, m.splice_align());
-                bool have_c = ct.empty() == false && align_to(ct, r.ids, ac);
-                if (have_c) whole_lines(ct, r.ids, ac, m.splice_align());
-                if (have_c && (!have_t || ac.matched > a2.matched)) a2 = std::move(ac);
-                if (have_t == false && have_c == false) return;
-                const size_t se = a2.stale.empty() ? 0 : a2.stale.back().first + a2.stale.back().second;
-                at_ck.push_back((int64_t) t.size());
-                int64_t e2 = -1;
-                for (int64_t c : at_ck)
-                    if (c <= (int64_t) a2.ref_end && c > (int64_t) se && c > e2) e2 = c;
+            const int64_t SA = m.splice_align(), SW = m.splice_window();
+            // the cut point for a candidate: the latest checkpoint C at
+            // which every stale span before C can be cut (none straddles
+            // C, each leaves a window of kept tokens after it); -1: none
+            const auto plan = [&](const std::vector<int32_t>& t, const Align& a2, std::vector<int64_t> cks,
+                                  int64_t& cut_out) {
+                cks.push_back((int64_t) t.size());
+                std::sort(cks.begin(), cks.end());
+                cks.erase(std::unique(cks.begin(), cks.end()), cks.end());
+                static const bool dbg_p = std::getenv("DS4_DUMP_IDS") != nullptr;
+                for (size_t i = cks.size(); i-- > 0;) {
+                    const int64_t C = cks[i];
+                    if (dbg_p && t.size() > 50000)
+                        std::fprintf(stderr, "ds4 try: ref %zu C %lld ref_end %zu\n", t.size(), (long long) C,
+                                     a2.ref_end);
+                    if (C < 256 || C > (int64_t) a2.ref_end) continue;
+                    int64_t end = C, cut = 0;
+                    bool ok = true;
+                    // (the model must read the client's turn markers in
+                    // the client's order: kept part by ref, then the rest)
+                    {
+                        std::vector<std::pair<int64_t, int>> early;
+                        std::vector<int> want, got;
+                        for (size_t q = 0; q < r.ids.size(); ++q) {
+                            if (is_mark(r.ids[q]) == false) continue;
+                            want.push_back(r.ids[q]);
+                            if (a2.ref_of[q] >= 0 && a2.ref_of[q] < C) early.push_back({a2.ref_of[q], r.ids[q]});
+                        }
+                        std::sort(early.begin(), early.end());
+                        for (const auto& x : early) got.push_back(x.second);
+                        for (size_t q = 0; q < r.ids.size(); ++q)
+                            if (is_mark(r.ids[q]) && (a2.ref_of[q] < 0 || a2.ref_of[q] >= C)) got.push_back(r.ids[q]);
+                        ok = got == want;
+                        static const bool dbg = std::getenv("DS4_DUMP_IDS") != nullptr;
+                        if (ok == false && dbg && t.size() > 50000) {
+                            size_t k = 0;
+                            while (k < got.size() && k < want.size() && got[k] == want[k]) ++k;
+                            size_t seen = 0, pq = SIZE_MAX;   // (the prompt position of want[k])
+                            for (size_t q = 0; q < r.ids.size() && pq == SIZE_MAX; ++q)
+                                if (is_mark(r.ids[q]) && seen++ == k) pq = q;
+                            std::fprintf(stderr, "ds4 plan: ref %zu C %lld: marker %zu of %zu differs (want %d got %d) "
+                                         "at prompt %zu ref_of %lld\n", t.size(), (long long) C, k, want.size(),
+                                         k < want.size() ? want[k] : -1, k < got.size() ? got[k] : -1, pq,
+                                         pq < r.ids.size() ? (long long) a2.ref_of[pq] : -2LL);
+                        }
+                    }
+                    for (size_t k = a2.stale.size(); ok && k-- > 0;) {
+                        const int64_t s = (int64_t) a2.stale[k].first, e = s + (int64_t) a2.stale[k].second;
+                        if (s >= C) continue;   // (past the cut point: dropped with the tail)
+                        if (e > C) {
+                            ok = false;
+                            break;
+                        }
+                        const int64_t a = (s + SA - 1) / SA * SA, b = e / SA * SA;
+                        if (b <= a) continue;
+                        if (b + SW > end) ok = false;
+                        end -= b - a;
+                        cut += b - a;
+                    }
+                    if (dbg_p && t.size() > 50000)
+                        std::fprintf(stderr, "ds4 try: ref %zu C %lld ok %d\n", t.size(), (long long) C, (int) ok);
+                    if (ok) {
+                        cut_out = cut;
+                        return C;
+                    }
+                }
+                return (int64_t) -1;
+            };
+            const auto consider = [&](long k, const std::vector<int32_t>& t, const std::vector<int64_t>& cks) {
+                Align a2;
+                // (a state that starts unlike the prompt is scrambled)
+                if (t.empty() || r.ids.empty() || t[0] != r.ids[0]) return;
+                static const bool dbg = std::getenv("DS4_DUMP_IDS") != nullptr;
+                const bool aligned = align_to(t, r.ids, a2);
+                if (dbg && t.size() > 50000)
+                    std::fprintf(stderr, "ds4 cand: ref %zu aligned %d matched %zu ref_end %zu stale %zu cks %zu\n",
+                                 t.size(), (int) aligned, a2.matched, a2.ref_end, a2.stale.size(), cks.size());
+                if (aligned == false) return;
+                whole_lines(t, r.ids, a2, SA);
                 int64_t cut = 0;
-                for (const auto& s : a2.stale) cut += (int64_t) s.second;
-                if (e2 >= 256 && e2 - cut > best_gain) {
-                    best_gain = e2 - cut;
-                    E = e2;
+                const int64_t C = plan(t, a2, cks, cut);
+                if (dbg && t.size() > 50000)
+                    std::fprintf(stderr, "ds4 cand: ref %zu after lines: matched %zu stale %zu; C %lld cut %lld\n",
+                                 t.size(), a2.matched, a2.stale.size(), (long long) C, (long long) cut);
+                if (C >= 256 && C - cut > best_gain) {
+                    best_gain = C - cut;
+                    E = C;
                     ref_slot = k;
                     al = std::move(a2);
                 }
             };
-            consider(-1, m.tokens(), last_client_ids, m.check_positions());
-            for (size_t k = 0; k < slots.size(); ++k) consider((long) k, slots[k].tokens, slots[k].client_tokens, slots[k].cks);
+            consider(-1, m.tokens(), m.live_positions());
+            for (size_t k = 0; k < slots.size(); ++k) consider((long) k, slots[k].tokens, slots[k].cks);
             const std::vector<int32_t>* ref = ref_slot >= 0 ? &slots[(size_t) ref_slot].tokens
                                               : ref_slot == -1 ? &m.tokens() : nullptr;
             if (ref != nullptr) {
-                // (re-align against the engine-order tokens, which is
-                // what slot_load restores and splice_out operates on)
-                Align engine_al;
-                align_to(*ref, r.ids, engine_al);
-                whole_lines(*ref, r.ids, engine_al, m.splice_align());
-                // (use the engine alignment's stale spans and E)
-                const size_t se2 = engine_al.stale.empty() ? 0 : engine_al.stale.back().first + engine_al.stale.back().second;
-                std::vector<int64_t> at_ck2 = ref_slot >= 0 ? slots[(size_t) ref_slot].cks : m.check_positions();
-                at_ck2.push_back((int64_t) ref->size());
-                int64_t E2 = -1;
-                for (int64_t c : at_ck2)
-                    if (c <= (int64_t) engine_al.ref_end && c > (int64_t) se2 && c > E2) E2 = c;
-                al = std::move(engine_al);
-                E = E2;
-                const size_t stale_end = al.stale.empty() ? 0 : al.stale.back().first + al.stale.back().second;
-                (void) stale_end;
                 size_t n_alike = 0;
                 if (E < 256) {
                     // (nothing kept to resume at: the prompt stays as sent)
@@ -1068,61 +1170,48 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         }
                         ok = nb > 0 && m.slot_load(bytes, nb, (int64_t) sl.tokens.size(), e);
                     }
-                    if (ok && E < m.pos()) ok = m.restore(E) && m.pos() == E;
-                    const int64_t A = m.splice_align();
-                    {   // every cut must leave a window of kept tokens after it
-                        int64_t end = E;   // (cuts go last first, so the state shrinks)
-                        for (size_t k = al.stale.size(); ok && k-- > 0;) {
-                            const int64_t a = ((int64_t) al.stale[k].first + A - 1) / A * A;
-                            const int64_t b = ((int64_t) (al.stale[k].first + al.stale[k].second)) / A * A;
-                            if (b <= a) continue;
-                            if (b + m.splice_window() > end) {
-                                ok = false;
-                                e = "a stale span ends too close to the kept end";
-                            }
-                            end -= b - a;
-                        }
-                    }
-                    if (ok == false && al.stale.empty() == false) {
-                        // (the splice can't cut near the end; the state is
-                        // already loaded in engine order; restore to the
-                        // checkpoint before the first stale span and reorder
-                        // the prompt to match what's kept)
-                        int64_t limit = (int64_t) al.stale.front().first;
-                        int64_t rs = m.restorable(limit);
-                        if (rs > 0 && m.restore(rs)) {
-                            r.ids = alike_first(r.ids, al, m.pos(), n_alike);
-                            std::fprintf(stderr, "ds4 serve: no splice (%s); restored to %lld, "
-                                         "reused %zu, %zu to read\n", e.c_str(), (long long) m.pos(),
-                                         n_alike, r.ids.size() - n_alike);
-                        } else {
-                            r.ids = alike_first(r.ids, al, E, n_alike);
-                            std::fprintf(stderr, "ds4 serve: no splice (%s); no checkpoint before "
-                                         "stale span, reused %zu, %zu to read\n", e.c_str(),
-                                         n_alike, r.ids.size() - n_alike);
-                        }
-                        e = "handled";
+                    // (back to the cut point; the tail past it is read again)
+                    if (ok && E < m.pos()) {
+                        ok = m.restore(E) && m.pos() == E;
+                        if (ok == false) e = "no checkpoint at the cut point";
                     }
                     int64_t cut = 0;
                     for (size_t k = al.stale.size(); ok && k-- > 0;) {   // (last first: earlier spans keep their place)
-                        const int64_t a = ((int64_t) al.stale[k].first + A - 1) / A * A;
-                        const int64_t b = ((int64_t) (al.stale[k].first + al.stale[k].second)) / A * A;
+                        const int64_t s = (int64_t) al.stale[k].first;
+                        if (s >= E) continue;
+                        const int64_t a = (s + SA - 1) / SA * SA;
+                        const int64_t b = (s + (int64_t) al.stale[k].second) / SA * SA;
                         if (b > a) {
                             ok = m.splice_out(a, b - a, e);
                             cut += ok ? b - a : 0;
                         }
                     }
+                    // the kept state must equal the prompt's tokens matched
+                    // before the cut point, in the state's order; the rest
+                    // of the prompt follows in the client's order
+                    std::vector<int> kept, rest;
+                    if (ok) {
+                        std::vector<std::pair<int64_t, int>> early;
+                        for (size_t t = 0; t < r.ids.size(); ++t) {
+                            const int64_t q = al.ref_of[t];
+                            if (q >= 0 && q < E) early.push_back({q, r.ids[t]});
+                            else rest.push_back(r.ids[t]);
+                        }
+                        std::sort(early.begin(), early.end());
+                        for (const auto& x : early) kept.push_back(x.second);
+                        const auto& stt = m.tokens();
+                        ok = kept.size() == stt.size() && std::equal(kept.begin(), kept.end(), stt.begin());
+                        if (ok == false) e = "the cut state differs from the prompt's kept tokens";
+                    }
                     if (ok) {
                         m.checkpoint(3);   // (the next prompt behind this start goes back here)
-                        std::vector<int> out(m.tokens().begin(), m.tokens().end());
-                        size_t dummy = 0;
-                        const std::vector<int> rest = alike_first(r.ids, al, E, dummy);   // (ref order past E)
-                        out.insert(out.end(), rest.begin() + (long) dummy, rest.end());
-                        n_alike = m.tokens().size();
-                        r.ids.swap(out);
-                        std::fprintf(stderr, "ds4 serve: spliced %lld stale tokens out of a kept conversation; "
-                                     "%zu tokens reused, %zu to read\n", (long long) cut, n_alike, r.ids.size() - n_alike);
-                    } else if (e != "handled") {
+                        n_alike = kept.size();
+                        kept.insert(kept.end(), rest.begin(), rest.end());
+                        r.ids.swap(kept);
+                        std::fprintf(stderr, "ds4 serve: spliced %lld stale tokens, cut point %lld; "
+                                     "%zu tokens reused, %zu to read\n", (long long) cut, (long long) E,
+                                     n_alike, r.ids.size() - n_alike);
+                    } else {
                         std::fprintf(stderr, "ds4 serve: splice failed (%s) - reading the prompt again\n", e.c_str());
                         m.reset();
                         held.clear();
@@ -1135,6 +1224,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                                  r.ids.size() - n_alike);
                 }
             }
+        }
+        if (const char* dump = std::getenv("DS4_DUMP_IDS")) {
+            // (debug: the token order the model reads, as int32)
+            std::ofstream f(dump, std::ios::binary | std::ios::trunc);
+            f.write((const char*) r.ids.data(), (std::streamsize) (r.ids.size() * sizeof(int)));
         }
         const auto& st = m.tokens();
         const size_t n_state = st.size();
@@ -1239,6 +1333,23 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         if (from > 0 && from < total) m.checkpoint(1);
         m.set_cancel([&in] { return in.stop.load(); });
         bool stopped = false;
+        // (a long read keeps a checkpoint before a turn marker
+        // every DS4_CK_EVERY tokens or so: a later turn goes back there)
+        static const size_t ck_every = [] {
+            const char* v = std::getenv("DS4_CK_EVERY");
+            return v ? (size_t) std::max(0, std::atoi(v)) : (size_t) 2048;
+        }();
+        size_t last_mark = done, mark_at = 0;
+        const auto next_mark = [&] {
+            mark_at = 0;
+            if (ck_every == 0) return;
+            for (size_t q = std::max(done + 1, last_mark + ck_every); q + 1 < total; ++q)
+                if (is_mark(r.ids[q])) {
+                    mark_at = q;
+                    return;
+                }
+        };
+        next_mark();
         while (ok && done < total) {
             if (in.stop.load()) {
                 stopped = true;
@@ -1246,6 +1357,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             }
             size_t n = std::min<size_t>((size_t) m.feed_unit(), total - done);
             if (pin_at > done && pin_at < done + n) n = pin_at - done;
+            if (mark_at > done && mark_at < done + n) n = mark_at - done;
             // (the prompt's end: the last token in the same run, the checkpoint before it kept on the way)
             const bool fin = done + n == total;
             if (fin && last_window) {
@@ -1257,6 +1369,11 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                          : m.feed(r.ids.data() + done, (int) n, 0, err);
             done += n;
             if (ok && pin_at != 0 && done == pin_at) m.checkpoint(3);
+            if (ok && mark_at != 0 && done == mark_at) {
+                m.mark();
+                last_mark = done;
+                next_mark();
+            }
             if (ok && (done >= next_pp || done == total)) {
                 const double ms = now_ms() - t0;
                 std::printf("PP %zu %zu %.1f %.1f %zu\n", done, r.ids.size(), ms,
@@ -1290,6 +1407,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         }
         held = std::move(pics);
         m.checkpoint(0);
+        m.mark();   // (each turn's end stays a place to go back to)
         if (!continued && slot_max > 0) m.pin();   // (a new run of prompts: where it may be rendered again from)
         const double t1 = now_ms();
         long long produced = 0;
