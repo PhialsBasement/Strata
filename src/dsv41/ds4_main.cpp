@@ -1056,30 +1056,62 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                             end -= b - a;
                         }
                     }
-                    if (ok == false && m.tokens().empty() == false) {
-                        // (no splice: keep the state as it is; rebuild the prompt
-                        // so it starts with the model's actual tokens, then the rest)
-                        const auto& st = m.tokens();
-                        std::vector<char> used(r.ids.size(), 0);
-                        size_t p = 0;
-                        for (size_t s = 0; s < (size_t) m.pos() && p < r.ids.size(); ++s) {
-                            while (p < r.ids.size() && (used[p] || r.ids[p] != st[s])) ++p;
-                            if (p < r.ids.size()) {
-                                used[p] = 1;
-                                ++p;
+                    if (ok == false) {
+                        // (no splice: the model state may be deeply reordered
+                        // from prior splices; drop it and pick the best slot
+                        // whose tokens the prompt shares the most of)
+                        m.reset();
+                        held.clear();
+                        long best_sl = -1;
+                        size_t best_n = 0;
+                        for (size_t k = 0; k < slots.size(); ++k) {
+                            Align a2;
+                            if (align_to(slots[k].tokens, r.ids, a2)) {
+                                whole_lines(slots[k].tokens, r.ids, a2, A);
+                                if (a2.matched > best_n) {
+                                    best_n = a2.matched;
+                                    best_sl = (long) k;
+                                }
                             }
                         }
-                        std::vector<int> out;
-                        out.reserve(r.ids.size());
-                        for (size_t t = 0; t < r.ids.size(); ++t)
-                            if (used[t]) out.push_back(r.ids[t]);
-                        n_alike = out.size();
-                        for (size_t t = 0; t < r.ids.size(); ++t)
-                            if (used[t] == 0) out.push_back(r.ids[t]);
-                        r.ids.swap(out);
-                        std::fprintf(stderr, "ds4 serve: no splice (%s); keeping %zu tokens of state, "
-                                     "reordered prompt has %zu alike + %zu new\n", e.c_str(),
-                                     m.tokens().size(), n_alike, r.ids.size() - n_alike);
+                        if (best_sl >= 0) {
+                            Slot& sl = slots[(size_t) best_sl];
+                            std::vector<uint8_t> file;
+                            const uint8_t* bytes = nullptr;
+                            size_t nb = 0;
+                            if (sl.data) {
+                                bytes = sl.data->data();
+                                nb = sl.data->size();
+                            } else {
+                                std::ifstream f(sl.path, std::ios::binary);
+                                file.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+                                bytes = file.data();
+                                nb = file.size();
+                            }
+                            std::string le;
+                            if (nb > 0 && m.slot_load(bytes, nb, (int64_t) sl.tokens.size(), le)) {
+                                Align a2;
+                                align_to(sl.tokens, r.ids, a2);
+                                whole_lines(sl.tokens, r.ids, a2, A);
+                                int64_t upto = (int64_t) sl.tokens.size();
+                                // (find the latest checkpoint at or before the first stale span)
+                                if (a2.stale.empty() == false) {
+                                    int64_t limit = (int64_t) a2.stale.front().first;
+                                    int64_t rs = m.restorable(limit);
+                                    if (rs > 0 && m.restore(rs)) upto = m.pos();
+                                    else upto = (int64_t) sl.tokens.size();
+                                }
+                                r.ids = alike_first(r.ids, a2, upto, n_alike);
+                                std::fprintf(stderr, "ds4 serve: no splice (%s); fell back to slot with "
+                                             "%zu tokens, reused %zu, %zu to read\n", e.c_str(),
+                                             sl.tokens.size(), n_alike, r.ids.size() - n_alike);
+                            } else {
+                                std::fprintf(stderr, "ds4 serve: no splice (%s); slot load failed (%s)\n",
+                                             e.c_str(), le.c_str());
+                            }
+                        } else {
+                            std::fprintf(stderr, "ds4 serve: no splice (%s); no usable slot found\n", e.c_str());
+                        }
                         e = "handled";
                     }
                     int64_t cut = 0;
