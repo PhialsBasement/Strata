@@ -1050,9 +1050,20 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 std::sort(cks.begin(), cks.end());
                 cks.erase(std::unique(cks.begin(), cks.end()), cks.end());
                 static const bool dbg_p = std::getenv("DS4_DUMP_IDS") != nullptr;
+                // (the prompt's turn markers: their ref positions in client
+                // order, the matched ones sorted, and how long a prefix of
+                // them is matched in increasing ref order)
+                std::vector<int64_t> mref, kref;
+                for (size_t q = 0; q < r.ids.size(); ++q)
+                    if (is_mark(r.ids[q])) mref.push_back(a2.ref_of[q]);
+                for (int64_t x : mref)
+                    if (x >= 0) kref.push_back(x);
+                std::sort(kref.begin(), kref.end());
+                size_t inc = 0;
+                while (inc < mref.size() && mref[inc] >= 0 && (inc == 0 || mref[inc] > mref[inc - 1])) ++inc;
                 for (size_t i = cks.size(); i-- > 0;) {
                     const int64_t C = cks[i];
-                    if (dbg_p && t.size() > 50000)
+                    if (dbg_p && t.size() > 20000)
                         std::fprintf(stderr, "ds4 try: ref %zu C %lld ref_end %zu\n", t.size(), (long long) C,
                                      a2.ref_end);
                     if (C < 256 || C > (int64_t) a2.ref_end) continue;
@@ -1063,32 +1074,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     int64_t end = C, cut = 0;
                     bool ok = true;
                     // (the model must read the client's turn markers in
-                    // the client's order: kept part by ref, then the rest)
+                    // the client's order: the kept ones are exactly the
+                    // first k, in increasing ref order, all before C)
                     {
-                        std::vector<std::pair<int64_t, int>> early;
-                        std::vector<int> want, got;
-                        for (size_t q = 0; q < r.ids.size(); ++q) {
-                            if (is_mark(r.ids[q]) == false) continue;
-                            want.push_back(r.ids[q]);
-                            if (a2.ref_of[q] >= 0 && a2.ref_of[q] < C) early.push_back({a2.ref_of[q], r.ids[q]});
-                        }
-                        std::sort(early.begin(), early.end());
-                        for (const auto& x : early) got.push_back(x.second);
-                        for (size_t q = 0; q < r.ids.size(); ++q)
-                            if (is_mark(r.ids[q]) && (a2.ref_of[q] < 0 || a2.ref_of[q] >= C)) got.push_back(r.ids[q]);
-                        ok = got == want;
-                        static const bool dbg = std::getenv("DS4_DUMP_IDS") != nullptr;
-                        if (ok == false && dbg && t.size() > 50000) {
-                            size_t k = 0;
-                            while (k < got.size() && k < want.size() && got[k] == want[k]) ++k;
-                            size_t seen = 0, pq = SIZE_MAX;   // (the prompt position of want[k])
-                            for (size_t q = 0; q < r.ids.size() && pq == SIZE_MAX; ++q)
-                                if (is_mark(r.ids[q]) && seen++ == k) pq = q;
-                            std::fprintf(stderr, "ds4 plan: ref %zu C %lld: marker %zu of %zu differs (want %d got %d) "
-                                         "at prompt %zu ref_of %lld\n", t.size(), (long long) C, k, want.size(),
-                                         k < want.size() ? want[k] : -1, k < got.size() ? got[k] : -1, pq,
-                                         pq < r.ids.size() ? (long long) a2.ref_of[pq] : -2LL);
-                        }
+                        const size_t k = (size_t) (std::lower_bound(kref.begin(), kref.end(), C) - kref.begin());
+                        ok = k <= inc && (k == 0 || mref[k - 1] < C);
+                        if (ok == false && dbg_p && t.size() > 20000)
+                            std::fprintf(stderr, "ds4 plan: ref %zu C %lld: %zu markers kept, %zu in order\n", t.size(),
+                                         (long long) C, k, inc);
                     }
                     for (size_t k = a2.stale.size(); ok && k-- > 0;) {
                         const int64_t s = (int64_t) a2.stale[k].first, e = s + (int64_t) a2.stale[k].second;
@@ -1103,7 +1096,26 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         end -= b - a;
                         cut += b - a;
                     }
-                    if (dbg_p && t.size() > 50000)
+                    if (ok) {
+                        // (the moved lines land at P, before the new turn's
+                        // marker: they must end on a group boundary and start
+                        // on one or after a plain token, or a later cut of
+                        // them takes that marker along)
+                        const int64_t P = C - cut;
+                        int64_t L = 0;
+                        for (size_t q = 0; q < r.ids.size(); ++q) {
+                            if (a2.ref_of[q] >= 0 && a2.ref_of[q] < C) continue;
+                            if (is_mark(r.ids[q])) break;
+                            ++L;
+                        }
+                        if (L > 0 && ((P + L) % SA != 0 || (P % SA != 0 && is_mark(t[(size_t) C - 1])))) {
+                            ok = false;
+                            if (dbg_p && t.size() > 20000)
+                                std::fprintf(stderr, "ds4 plan: ref %zu C %lld: moved %lld at %lld off the grid\n",
+                                             t.size(), (long long) C, (long long) L, (long long) P);
+                        }
+                    }
+                    if (dbg_p && t.size() > 20000)
                         std::fprintf(stderr, "ds4 try: ref %zu C %lld ok %d\n", t.size(), (long long) C, (int) ok);
                     if (ok) {
                         cut_out = cut;
@@ -1118,14 +1130,14 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 if (t.empty() || r.ids.empty() || t[0] != r.ids[0]) return;
                 static const bool dbg = std::getenv("DS4_DUMP_IDS") != nullptr;
                 const bool aligned = align_to(t, r.ids, a2);
-                if (dbg && t.size() > 50000)
+                if (dbg && t.size() > 20000)
                     std::fprintf(stderr, "ds4 cand: ref %zu aligned %d matched %zu ref_end %zu stale %zu cks %zu\n",
                                  t.size(), (int) aligned, a2.matched, a2.ref_end, a2.stale.size(), cks.size());
                 if (aligned == false) return;
                 whole_lines(t, r.ids, a2, SA);
                 int64_t cut = 0;
                 const int64_t C = plan(t, a2, cks, cut);
-                if (dbg && t.size() > 50000)
+                if (dbg && t.size() > 20000)
                     std::fprintf(stderr, "ds4 cand: ref %zu after lines: matched %zu stale %zu; C %lld cut %lld\n",
                                  t.size(), a2.matched, a2.stale.size(), (long long) C, (long long) cut);
                 if (C >= 256 && C - cut > best_gain) {
