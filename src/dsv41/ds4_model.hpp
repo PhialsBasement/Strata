@@ -84,6 +84,11 @@ struct Stats {
     int64_t swaps = 0;                // experts the cache moved into VRAM
     int64_t skipped = 0;              // routed experts STRATA_DS4_DISK_SKIP_W left out (light, not in RAM)
     int64_t ram_experts = 0, ram_moves = 0;   // CPU-lane experts read from the RAM tier; experts moved into it
+    int64_t kx_experts = 0, kx_fails = 0;     // DS4_EXPERTD: picks the daemon computed, its failed requests
+    double kx_wait_ms = 0.0;                  // (the lane's wait for its replies, after its own experts)
+    int64_t kx_held = 0;                      // experts the daemon holds
+    int64_t kx_moved = 0;                     // its picks the split gave the lane (it would finish later)
+    int64_t kx_swaps = 0, kx_swap_fails = 0;  // live placement: experts swapped in, swaps refused
     double prof_ms[6] = {};          // DS4_PROF: the GPU's time in decode by stage (between layers, attention, routing +
     int64_t prof_tokens = 0;         // shared expert, experts' gate / up, the wait for the CPU lane, down + post)
     // lookahead (decode windows of one): the picks of layers guessed a layer before (the next layer's gate on this

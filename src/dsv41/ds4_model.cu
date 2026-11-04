@@ -26,6 +26,7 @@
 #include "ds4_pool.hpp"
 #include "ds4_store.hpp"
 #include "ds4_vision.cuh"
+#include "expertd/expertd_client.hpp"   // DS4_EXPERTD: a second GPU's experts
 #include "strata/dsv41/exl3_cpu.hpp"
 #include "strata/dsv41/exl3.hpp"
 #include "strata/kernels/f16_bits.hpp"
@@ -1137,6 +1138,12 @@ struct Model::Impl {
     unsigned seq_issued = 0;
     std::atomic<int> layer_of[kRing];
     std::thread service;
+#if !defined(_WIN32)
+    std::unique_ptr<::strata::dsv41::expertd::Client> kxd;   // DS4_EXPERTD=host:port
+    std::thread kx_place_th;                 // (its live placement)
+    std::atomic<bool> lane_busy{false};      // the lane is on a request
+    std::atomic<unsigned> lane_done{0};      // the requests it answered
+#endif
     std::atomic<bool> quit{false};
     std::thread store_bg;   // the RAM store's fill beyond the first 48 GB, read after the model is ready (preload_store)
 #if defined(STRATA_METAL)
@@ -1231,6 +1238,9 @@ struct Model::Impl {
     bool prompt_feed = false;   // (feed / feed_mark: a prompt is read)
     bool resident(const Layer& l, int e) const {
         if (l.slot.empty() == false && l.slot[(size_t) e] >= 0) return true;
+#if !defined(_WIN32)
+        if (kxd && kxd->holds(l.il, e)) return true;   // (the expert daemon's)
+#endif
         if (store && store->find(l.il, e) >= 0) return true;
         return in_ram(l, e);
     }
@@ -1239,6 +1249,12 @@ struct Model::Impl {
     // the resident set is looked at every 16 tokens.  0: off
     const float tie_pen = [] {
         const char* v = std::getenv("DS4_TIE_PEN");
+        return v ? (float) std::atof(v) : 0.0f;
+    }();
+    // DS4_TIE_PEN_RAM=d: the CPU lane's (RAM-held) experts less d
+    // too, so near-ties go to the GPUs' (VRAM, the expert daemon)
+    const float tie_pen_ram = [] {
+        const char* v = std::getenv("DS4_TIE_PEN_RAM");
         return v ? (float) std::atof(v) : 0.0f;
     }();
     const float* tie_bias(Dev& d, Layer& l, cudaStream_t s) {
@@ -1268,11 +1284,21 @@ struct Model::Impl {
         // cache probe, mincore a matrix was ~10 ms a token)
         const auto here = [&](int e) {
             if (lead.slot.empty() == false && lead.slot[(size_t) e] >= 0) return true;
+#if !defined(_WIN32)
+            if (kxd && kxd->holds(lead.il, e)) return true;
+#endif
             if (store) return store->find(lead.il, e) >= 0;
             return in_ram(lead, e);
         };
+        const auto on_gpu = [&](int e) {
+            if (lead.slot.empty() == false && lead.slot[(size_t) e] >= 0) return true;
+#if !defined(_WIN32)
+            if (kxd && kxd->holds(lead.il, e)) return true;
+#endif
+            return false;
+        };
         for (size_t e = 0; e < n; ++e)
-            l.h_tie_bias[e] = l.h_gate_bias[e] - (here((int) e) ? 0.0f : tie_pen);
+            l.h_tie_bias[e] = l.h_gate_bias[e] - (!here((int) e) ? tie_pen : on_gpu((int) e) ? 0.0f : tie_pen_ram);
         // (stream order: the router below reads it after the copy)
         if (cudaMemcpyAsync(l.tie_bias, l.h_tie_bias, n * 4, cudaMemcpyHostToDevice, s) != cudaSuccess ||
             cudaEventRecord(l.tie_ev, s) != cudaSuccess)
@@ -1598,6 +1624,9 @@ struct Model::Impl {
             }
         quit.store(true);
         if (service.joinable()) service.join();
+#if !defined(_WIN32)
+        if (kx_place_th.joinable()) kx_place_th.join();
+#endif
         if (store_bg.joinable()) store_bg.join();   // (the store's background fill: it checks quit between its pieces)
         {
             std::lock_guard<std::mutex> lk(pf_mu);
@@ -3261,6 +3290,24 @@ struct Model::Impl {
                 if (core >= 0) pin_self(core);
                 serve_lane();
             });
+#if !defined(_WIN32)
+            if (const char* kx = std::getenv("DS4_EXPERTD")) {   // the daemon's candidates: CPU-lane experts, hottest first
+                std::vector<std::pair<uint32_t, ::strata::dsv41::expertd::Id>> rk;
+                for (size_t li = 0; li < L.size(); ++li) {
+                    const Layer& l = L[li];
+                    if (l.mtp || l.il < 0 || l.il >= g.nl || l.n_exp != g.n_exp) continue;
+                    for (int e = 0; e < l.n_exp; ++e)
+                        if (l.slot.empty() || l.slot[(size_t) e] < 0)
+                            rk.push_back({prof[li * (size_t) g.n_exp + e], {(uint16_t) l.il, (uint16_t) e}});
+                }
+                std::stable_sort(rk.begin(), rk.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                std::vector<::strata::dsv41::expertd::Id> cand;
+                for (const auto& x : rk) cand.push_back(x.second);
+                kxd = std::make_unique<::strata::dsv41::expertd::Client>();
+                kxd->start(kx, g.dim, g.ff, g.lim, std::move(cand), g.nl, g.n_exp);
+                if (std::getenv("DS4_EXPERTD_STATIC") == nullptr) kx_place_th = std::thread([this] { kx_place_loop(); });
+            }
+#endif
             if (ahead_mode > 0) pf_th = std::thread([this] { prefetch_loop(); });
         }
         if (o.expert_cache) {
@@ -7732,6 +7779,9 @@ struct Model::Impl {
                 continue;
             }
             std::atomic_thread_fence(std::memory_order_acquire);
+#if !defined(_WIN32)
+            lane_busy.store(true, std::memory_order_seq_cst);   // (before any holds(): the placer's wait)
+#endif
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
             Resp& rp = resps[next % kRing];
             const int T = std::max(1, std::min(kWin, r.T));
@@ -7824,6 +7874,56 @@ struct Model::Impl {
                     }
                 }
                 if (ahead_mode > 0 && !ahead_for.empty()) ahead_ask(li, r, next, T);
+#if !defined(_WIN32)
+                // the expert daemon's picks go out now; its sums
+                // are added after the lane's own (or, if it fails,
+                // the lane computes them: kx_back)
+                std::vector<std::pair<int, int>> kx_back;
+                std::vector<::strata::dsv41::expertd::Pair> kx_pairs;
+                bool kx_sent = false;
+                if (kxd && kxd->ready() && !l.mtp) {
+                    size_t keep = 0;
+                    for (const auto& pk : picks) {
+                        const int t = pk.second / kPicks, i = pk.second % kPicks;
+                        if (kxd->holds(l.il, pk.first) && kx_pairs.size() < (size_t) ::strata::dsv41::expertd::kMaxPairs) {
+                            kx_pairs.push_back({(uint16_t) pk.first, (uint16_t) t, r.w[t][i]});
+                            kx_back.push_back(pk);
+                        } else {
+                            picks[keep++] = pk;
+                        }
+                    }
+                    picks.resize(keep);
+                    // the split: move j of the daemon's picks (RAM-held
+                    // ones) to the lane, j minimising the slower of the
+                    // two (latencies learnt by pick count: kx_lat)
+                    if (!kx_pairs.empty() && !kx_nobal && T == 1) {
+                        const int k = (int) kx_pairs.size(), c = (int) picks.size();
+                        int best = 0;
+                        double bt = 1e30;
+                        for (int j = 0; j <= k; ++j) {
+                            const double t = std::max(kx_klat(l.il, k - j), kx_clat(l.il, c + j));
+                            if (t < bt - 1.0) { bt = t; best = j; }
+                        }
+                        for (int q = k - 1; q >= 0 && best > 0; --q) {
+                            const int e = kx_pairs[(size_t) q].e;
+                            if (!in_ram(l, e) && !(store && store->find(l.il, e) >= 0)) continue;
+                            picks.push_back(kx_back[(size_t) q]);
+                            kx_pairs.erase(kx_pairs.begin() + q);
+                            kx_back.erase(kx_back.begin() + q);
+                            ++st.kx_moved;
+                            --best;
+                        }
+                    }
+                    if (!kx_pairs.empty()) {
+                        kx_sent = kxd->send(next, l.il, T, &r.x[0][0], (size_t) kMaxDim, kx_pairs);
+                        if (!kx_sent) {
+                            ++st.kx_fails;
+                            picks.insert(picks.end(), kx_back.begin(), kx_back.end());
+                            kx_back.clear();
+                        }
+                    }
+                }
+#endif
                 std::sort(picks.begin(), picks.end());
                 for (size_t a = 0; a < picks.size();) {
                     Ent en;
@@ -7877,15 +7977,178 @@ struct Model::Impl {
                     }
                     st.cpu_ms += now_ms() - tc;
                     st.cpu_experts += nslots;
+#if !defined(_WIN32)
+                    if (nslots > 0 && T == 1) kx_learn(kx_cl[l.il & (kLatL - 1)], nslots, (now_ms() - tc) * 1000.0);
+#endif
                 }
+#if !defined(_WIN32)
+                if (kx_sent) {
+                    const double tk = now_ms();
+                    const int D = g.dim;
+                    uint32_t mask = 0, us = 0;
+                    kx_y.resize((size_t) ::strata::dsv41::expertd::kMaxT * D);
+                    if (kxd->recv(next, kx_y.data(), (size_t) D, mask, us)) {
+                        if (T == 1)   // (the daemon's time, plus the wire's)
+                            kx_learn(kx_kl[l.il & (kLatL - 1)], (int) kx_pairs.size(), (double) us + kx_net_us);
+                        for (int t = 0; t < T; ++t) {
+                            if (((mask >> t) & 1u) == 0) continue;
+                            float* o = rp.part[t];
+                            const float* y = kx_y.data() + (size_t) t * D;
+                            if (rp.cpu[t] == 0)
+                                for (int e = 0; e < D; ++e) o[e] = y[e];
+                            else
+                                for (int e = 0; e < D; ++e) o[e] += y[e];
+                            rp.cpu[t] = 1;
+                        }
+                        st.kx_experts += (int64_t) kx_pairs.size();
+                    } else {
+                        ++st.kx_fails;
+                        kx_cpu(l, r, rp, kx_back);
+                    }
+                    st.kx_wait_ms += now_ms() - tk;
+                }
+#endif
             }
             std::atomic_thread_fence(std::memory_order_release);
             *(volatile unsigned*) &rp.seq = next;
+#if !defined(_WIN32)
+            lane_done.store(next, std::memory_order_seq_cst);
+            lane_busy.store(false, std::memory_order_seq_cst);
+#endif
             ++next;
             last = std::chrono::steady_clock::now();
         }
     }
 
+#if !defined(_WIN32)
+    // DS4_EXPERTD's live placement: every 250 ms, the CPU lane's
+    // hottest experts (l.heat) take the daemon's coldest slots,
+    // a few at a time; experts now in VRAM are evicted first
+    void kx_place_loop() {
+        using Id = ::strata::dsv41::expertd::Id;
+        struct H {
+            float h;
+            int il, e;
+        };
+        static const int max_round = std::getenv("DS4_EXPERTD_SWAPS") ? std::atoi(std::getenv("DS4_EXPERTD_SWAPS")) : 8;
+        while (!quit.load(std::memory_order_relaxed)) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(250));
+            if (kxd && !kxd->ready()) {
+                kxd->reconnect();   // (a restarted daemon)
+                continue;
+            }
+            if (!kxd) continue;
+            std::vector<H> hot, cold;
+            for (const Layer& l : L) {
+                if (l.mtp || l.il < 0 || l.il >= g.nl || l.n_exp != g.n_exp || l.heat.size() != (size_t) l.n_exp) continue;
+                // (the daemon takes the i-quant layers iq::mv takes)
+                bool fits = true;
+                for (int r = 0; r < 3; ++r) {
+                    const int ty = gg::expert_type(l.lay, r);
+                    fits = fits && gg::iq::supported(ty) && !gg::iq::is_tq(ty);
+                }
+                // an expert's worth there: its heat times the time a pick
+                // saves in its layer (the lane's minus the daemon's)
+                const float gain = (float) kx_gain(l.il);
+                for (int e = 0; e < l.n_exp; ++e) {
+                    const bool vram = !l.slot.empty() && l.slot[(size_t) e] >= 0;
+                    const bool kx = kxd->holds(l.il, e);
+                    const float v = l.heat[(size_t) e] * gain;
+                    if (kx) cold.push_back({vram ? -1.0f : v, l.il, e});
+                    else if (!vram && fits && gain > 0.0f) hot.push_back({v, l.il, e});
+                }
+            }
+            std::sort(hot.begin(), hot.end(), [](const H& a, const H& b) { return a.h > b.h; });
+            std::sort(cold.begin(), cold.end(), [](const H& a, const H& b) { return a.h < b.h; });
+            const size_t n = std::min(hot.size(), cold.size());
+            for (size_t i = 0; i < n && (int) i < max_round && !quit.load(std::memory_order_relaxed); ++i) {
+                if (hot[i].h <= 1.25f * cold[i].h + 2.0f * kx_gain_ref) break;
+                kxd->unhold(cold[i].il, cold[i].e);
+                std::atomic_thread_fence(std::memory_order_seq_cst);
+                // (a request that may still hold it: answered first)
+                const unsigned d0 = lane_done.load(std::memory_order_seq_cst);
+                while (lane_busy.load(std::memory_order_seq_cst) && lane_done.load(std::memory_order_seq_cst) == d0 &&
+                       !quit.load(std::memory_order_relaxed))
+                    std::this_thread::sleep_for(std::chrono::microseconds(50));
+                if (kxd->swap(Id{(uint16_t) cold[i].il, (uint16_t) cold[i].e}, Id{(uint16_t) hot[i].il, (uint16_t) hot[i].e}))
+                    ++st.kx_swaps;
+                else
+                    ++st.kx_swap_fails;
+            }
+        }
+    }
+    std::vector<float> kx_y;   // (the lane's copy of a daemon reply)
+    // the split's latencies by pick count (us), learnt as it runs:
+    // the daemon's (kx_kl, plus kx_net_us) and the lane's (kx_cl)
+    static constexpr int kLat = 17, kLatL = 64;   // (counts; layers)
+    double kx_kl[kLatL][kLat] = {}, kx_cl[kLatL][kLat] = {};
+    const double kx_net_us = 60.0;
+    const bool kx_nobal = std::getenv("DS4_EXPERTD_NOBAL") != nullptr;   // (A/B: no split)
+    static void kx_learn(double* t, int n, double us) {
+        if (n < 1) return;
+        n = std::min(n, kLat - 1);
+        t[n] = t[n] > 0.0 ? 0.9 * t[n] + 0.1 * us : us;
+    }
+    // a count's latency: learnt, else a line through the learnt
+    // counts below it (or a prior: 130 + 160 n, 340 n)
+    static double kx_lat(const double* t, int n, double a0, double b0) {
+        if (n <= 0) return 0.0;
+        if (n < kLat && t[n] > 0.0) return t[n];
+        for (int m = std::min(n, kLat) - 1; m >= 1; --m)
+            if (t[m] > 0.0) return t[m] * (double) n / (double) m;
+        return a0 + b0 * (double) n;
+    }
+    double kx_klat(int il, int n) const { return kx_lat(kx_kl[il & (kLatL - 1)], n, 130.0, 160.0); }
+    double kx_clat(int il, int n) const { return kx_lat(kx_cl[il & (kLatL - 1)], n, 0.0, 340.0); }
+    // a pick's saving in a layer (us): the lane's per-pick time less
+    // the daemon's (its 1 -> 3 picks slope; the fixed cost is paid
+    // once a layer anyway); a floor before both are learnt
+    double kx_gain(int il) const {
+        const double* k = kx_kl[il & (kLatL - 1)];
+        const double* c = kx_cl[il & (kLatL - 1)];
+        if (k[1] <= 0.0 || c[1] <= 0.0) return 100.0;
+        const double kp = k[3] > 0.0 ? (k[3] - k[1]) / 2.0 : k[2] > 0.0 ? k[2] - k[1] : k[1] * 0.6;
+        const double cp = c[3] > 0.0 ? c[3] / 3.0 : c[2] > 0.0 ? c[2] / 2.0 : c[1];
+        return cp - std::max(kp, 1.0);
+    }
+    static constexpr float kx_gain_ref = 100.0f;   // (the margin's scale)
+    // DS4_EXPERTD: a failed request's picks (expert, t kPicks + i)
+    // computed by the lane after all, added into rp.part
+    void kx_cpu(const Layer& l, const Req& r, Resp& rp, std::vector<std::pair<int, int>>& pk) {
+        if (pk.empty()) return;
+        std::sort(pk.begin(), pk.end());
+        std::vector<Ent> es;
+        float wv[kWin * kPicks];
+        int tok_of[kWin * kPicks];
+        int ns = 0;
+        for (size_t a = 0; a < pk.size();) {
+            Ent en;
+            en.e = pk[a].first;
+            en.slot0 = ns;
+            while (a < pk.size() && pk[a].first == en.e && en.n < ent_cap(l)) {
+                const int t = pk[a].second / kPicks, i = pk[a].second % kPicks;
+                en.tok[en.n++] = t;
+                tok_of[ns] = t;
+                wv[ns] = r.w[t][i];
+                ++ns;
+                ++a;
+            }
+            es.push_back(en);
+        }
+        cpu_experts(l, &r.x[0][0], es, (size_t) kMaxDim);
+        const int D = g.dim;
+        for (int sl = 0; sl < ns; ++sl) {
+            const int t = tok_of[sl];
+            float* o = rp.part[t];
+            if (rp.cpu[t] == 0) {
+                for (int e = 0; e < D; ++e) o[e] = 0.0f;
+                rp.cpu[t] = 1;
+            }
+            const float* y = c_yd.data() + (size_t) sl * D;
+            for (int e = 0; e < D; ++e) o[e] += wv[sl] * y[e];
+        }
+    }
+#endif
     // a GGUF's matrices (BF16 / MXFP4) to its own kernels, EXL3 ones to x3's
     static bool mv_any(const x3::MvJob* j, int n, cudaStream_t s) {
         bool g = false;
