@@ -17,8 +17,8 @@ namespace strata::ds4 {
 
 /// F32 -> BF16 bits, round to nearest even (a NaN stays a NaN).
 __device__ __forceinline__ uint16_t bf16_rn(float f) {
-#if !defined(STRATA_USE_HIP)
-    return __bfloat16_as_ushort(__float2bfloat16_rn(f));
+#if !defined(STRATA_USE_HIP) && !(defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 520)
+    return __bfloat16_as_ushort(__float2bfloat16_rn(f));   // (Kepler: CUDA 11 lacks it; the same bits below)
 #else
     const uint32_t u = __float_as_uint(f);
     if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t) ((u >> 16) | 0x40u);

@@ -9,6 +9,7 @@
 #endif
 #include "ds4_numerics.cuh"
 #include "ds4_experts_rule.hpp"
+#include "../../include/strata/kernels/dp4a.hpp"   // STRATA_DP4A: __dp4a, or bit-exact below sm_61
 
 #include <cuda_fp16.h>
 #if !defined(STRATA_USE_HIP)
@@ -356,24 +357,24 @@ __device__ __forceinline__ void decode(const uint8_t* __restrict__ row, int kb, 
 // its scales in F32 (explicit roundings: every instantiation the same bits)
 template <int T>
 __device__ __forceinline__ float sub_dot(const Sub& s, const int4& xa, const int4& xb) {
-    int lo = __dp4a(s.q[0], xa.x, 0);
-    lo = __dp4a(s.q[1], xa.y, lo);
-    lo = __dp4a(s.q[2], xa.z, lo);
-    lo = __dp4a(s.q[3], xa.w, lo);
-    int hi = __dp4a(s.q[4], xb.x, 0);
-    hi = __dp4a(s.q[5], xb.y, hi);
-    hi = __dp4a(s.q[6], xb.z, hi);
-    hi = __dp4a(s.q[7], xb.w, hi);
+    int lo = STRATA_DP4A(s.q[0], xa.x, 0);
+    lo = STRATA_DP4A(s.q[1], xa.y, lo);
+    lo = STRATA_DP4A(s.q[2], xa.z, lo);
+    lo = STRATA_DP4A(s.q[3], xa.w, lo);
+    int hi = STRATA_DP4A(s.q[4], xb.x, 0);
+    hi = STRATA_DP4A(s.q[5], xb.y, hi);
+    hi = STRATA_DP4A(s.q[6], xb.z, hi);
+    hi = STRATA_DP4A(s.q[7], xb.w, hi);
     float v = __fmul_rn(s.d, (float) (s.s0 * lo + s.s1 * hi));
     if constexpr (Ty<T>::MIN) {
-        int sl = __dp4a(0x01010101, xa.x, 0);
-        sl = __dp4a(0x01010101, xa.y, sl);
-        sl = __dp4a(0x01010101, xa.z, sl);
-        sl = __dp4a(0x01010101, xa.w, sl);
-        int sh = __dp4a(0x01010101, xb.x, 0);
-        sh = __dp4a(0x01010101, xb.y, sh);
-        sh = __dp4a(0x01010101, xb.z, sh);
-        sh = __dp4a(0x01010101, xb.w, sh);
+        int sl = STRATA_DP4A(0x01010101, xa.x, 0);
+        sl = STRATA_DP4A(0x01010101, xa.y, sl);
+        sl = STRATA_DP4A(0x01010101, xa.z, sl);
+        sl = STRATA_DP4A(0x01010101, xa.w, sl);
+        int sh = STRATA_DP4A(0x01010101, xb.x, 0);
+        sh = STRATA_DP4A(0x01010101, xb.y, sh);
+        sh = STRATA_DP4A(0x01010101, xb.z, sh);
+        sh = STRATA_DP4A(0x01010101, xb.w, sh);
         v = __fsub_rn(v, __fadd_rn(__fmul_rn(s.m0, (float) sl), __fmul_rn(s.m1, (float) sh)));
     }
     return v;
@@ -813,7 +814,7 @@ __global__ void __launch_bounds__(kThreads) set_kernel(const SetArgs a) {
     }
 }
 
-#if !defined(STRATA_USE_HIP)
+#if !defined(STRATA_USE_HIP) && (!defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 700)
 // the same on the tensor cores (sm_70+): 8 warps each 16 rows x 32 outputs, the tiles F16 in shared memory
 namespace wm = nvcuda::wmma;
 constexpr int kLdT = 40;
@@ -900,6 +901,10 @@ __global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs a) {
         else a.y[lr * a.ldo + c0 + c] = O.g[r][c];
     }
 }
+#elif !defined(STRATA_USE_HIP)
+// below sm_70 (no tensor cores): tc_ok() never picks it
+template <int T, bool GATE_UP>
+__global__ void __launch_bounds__(kThreads) set_tc_kernel(const SetArgs) {}
 #endif
 
 // ---------------------------------------------------------------- GEMVs
@@ -1274,8 +1279,120 @@ bool light_set(const SetArgs& a, bool gu, cudaStream_t s) {
     return true;
 }
 
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+// Kepler (no __dp4a): IQ1_S's integer dot in exact fp32,
+// L = 8 sum n x - (7|9) sum x; P lanes and R rows a group,
+// P 32 gives mv_kernel's bits exactly
+__device__ __forceinline__ float kp_byte(uint32_t v, uint32_t sel, float bias) {
+    return __int_as_float((int) __byte_perm(v, 0x4B000000u, 0x7440u | sel)) - bias;
+}
+template <int P, int R>
+__global__ void __launch_bounds__(kThreads) kepler_iq1s_kernel(const Jobs J) {
+    __shared__ uint32_t tab[Ty<kIQ1_S>::TAB];
+    load_tab<kIQ1_S>(tab);
+    __syncthreads();
+    const MvJob& b = J.j[blockIdx.y];
+    const int lane = threadIdx.x & (P - 1);
+    const int row0 = (blockIdx.x * (kThreads / P) + (int) threadIdx.x / P) * R;
+    const int nsb = b.k / 32;
+    const bool live = row0 < b.n;   // (idle groups still shuffle)
+    float acc[R];
+#pragma unroll
+    for (int r = 0; r < R; ++r) acc[r] = 0.0f;
+    for (int kb = lane; live && kb < nsb; kb += P) {
+        const uint4* xp = (const uint4*) (b.xq + (size_t) kb * 32);
+        const uint4 xa = __ldg(xp), xb = __ldg(xp + 1);
+        const uint32_t xw[8] = {xa.x ^ 0x80808080u, xa.y ^ 0x80808080u, xa.z ^ 0x80808080u,
+                                xa.w ^ 0x80808080u, xb.x ^ 0x80808080u, xb.y ^ 0x80808080u,
+                                xb.z ^ 0x80808080u, xb.w ^ 0x80808080u};
+        float xf[32], sx = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 32; ++i) {
+            xf[i] = kp_byte(xw[i >> 2], (uint32_t) (i & 3), 8388736.0f);
+            sx += xf[i];
+        }
+        const float dx = __ldg(b.xd + kb);
+        const int ib = kb & 7;
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            const int row = row0 + r;
+            if (row >= b.n) break;
+            const uint16_t* q16 = (const uint16_t*) (b.w + (size_t) row * b.ld + (size_t) (kb >> 3) * Ty<kIQ1_S>::B);
+            const uint32_t qh = __ldg(q16 + 17 + ib);
+            const uint32_t qs = (uint32_t) __ldg(q16 + 1 + 2 * ib) | ((uint32_t) __ldg(q16 + 2 + 2 * ib) << 16);
+            float nx = 0.0f;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const uint32_t g = tab[((qs >> (8 * l)) & 255u) | (((qh >> (3 * l)) & 7u) << 8)];
+                const uint32_t lo = g & 0x0F0F0F0Fu, hi = (g >> 4) & 0x0F0F0F0Fu;
+#pragma unroll
+                for (int m = 0; m < 4; ++m) {
+                    nx = fmaf(kp_byte(lo, (uint32_t) m, 8388608.0f), xf[8 * l + m], nx);
+                    nx = fmaf(kp_byte(hi, (uint32_t) m, 8388608.0f), xf[8 * l + 4 + m], nx);
+                }
+            }
+            const float L = 8.0f * nx - ((qh & 0x8000u) ? 9.0f : 7.0f) * sx;
+            const float sc = (float) (2 * (int) ((qh >> 12) & 7u) + 1);
+            const float d = __half2float(__ushort_as_half(__ldg(q16))) * 0.125f;
+            acc[r] = fmaf(dx, __fmul_rn(d, sc * L), acc[r]);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        float v = acc[r];
+#pragma unroll
+        for (int o = P / 2; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+        const int row = row0 + r;
+        if (lane == 0 && live && row < b.n)
+            b.y[row] = b.alpha * v + (b.bias != nullptr ? b.bias[row] : 0.0f);
+    }
+}
+// whether this device is Kepler (cached a device);
+// DS4_KEPLER_IQ1S=0: never
+bool kepler_dev() {
+    static int cc[64];
+    static const bool off = [] {
+        const char* e = std::getenv("DS4_KEPLER_IQ1S");
+        return e != nullptr && std::atoi(e) == 0;
+    }();
+    int dev = 0;
+    if (off || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;
+    if (cc[dev] == 0) {
+        int major = 0;
+        if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev) != cudaSuccess) return false;
+        cc[dev] = major > 0 ? major : -1;
+    }
+    return cc[dev] > 0 && cc[dev] < 5;
+}
+// 32 lanes a row when every job's sub-blocks split evenly
+// (gate, up), else 8 (down); DS4_KEPLER_EXACT=1: 32
+bool kepler_mv_iq1s(const Jobs& J, int nj, int max_n, cudaStream_t s) {
+    if (!kepler_dev()) return false;
+    static const bool exact = [] {
+        const char* e = std::getenv("DS4_KEPLER_EXACT");
+        return e != nullptr && std::atoi(e) != 0;
+    }();
+    bool even = true;
+    for (int i = 0; i < nj; ++i) even = even && (J.j[i].k / 32) % 32 == 0;
+    if (exact || even) {
+        const dim3 grid((unsigned) ((max_n + kWarps * 2 - 1) / (kWarps * 2)), (unsigned) nj);
+        strata_ds4_launch(kepler_iq1s_kernel<32, 2>, grid, kThreads, 0, s, J);
+    } else {
+        const int rows = kThreads / 8;
+        const dim3 grid((unsigned) ((max_n + rows - 1) / rows), (unsigned) nj);
+        strata_ds4_launch(kepler_iq1s_kernel<8, 1>, grid, kThreads, 0, s, J);
+    }
+    return true;
+}
+#endif
+
 template <int T>
 void mv_nc(const Jobs& J, int nj, int max_n, int max_c, cudaStream_t s) {
+#if !defined(STRATA_USE_HIP) && !defined(STRATA_METAL)
+    if constexpr (T == kIQ1_S) {
+        if (max_c <= 1 && kepler_mv_iq1s(J, nj, max_n, s)) return;
+    }
+#endif
     const dim3 grid((unsigned) ((max_n + kWarps - 1) / kWarps), (unsigned) nj);
     if (max_c <= 1) strata_ds4_launch(mv_kernel<T, 1>, grid, kThreads, 0, s, J);
     else if (max_c <= 4) strata_ds4_launch(mv_kernel<T, 4>, grid, kThreads, 0, s, J);
