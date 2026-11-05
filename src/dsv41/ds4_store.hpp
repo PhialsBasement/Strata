@@ -319,6 +319,15 @@ public:
         const int s = where_[(size_t) layer][(size_t) e];
         if (s >= 0) slots_[(size_t) s].tick = ++clock_;
     }
+    /// An expert another device holds: its slot (if any) the first a
+    /// demand read takes; readable until then
+    void demote(int layer, int e) {
+        if (layer < 0 || layer >= (int) where_.size()) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        heat_[(size_t) layer][(size_t) e] = 0.0f;
+        const int s = where_[(size_t) layer][(size_t) e];
+        if (s >= 0) slots_[(size_t) s].tick = 0;
+    }
     bool gpu_mapped() const { return !chunk_dev_.empty() && chunk_dev_[0] != nullptr; }
     /// The arena's address range (the device sees its host pointers as they are when the mapping is the identity)
     unsigned long long arena_lo() const { return (unsigned long long) (uintptr_t) arena_; }

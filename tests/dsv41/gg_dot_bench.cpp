@@ -6,6 +6,7 @@
 // weights (default 3072, far past L3) on N threads, as GB/s of weights read, beside a plain streaming read of the same
 // bytes (the memory ceiling the rows are measured against).
 #include "ds4_gguf_cpu.hpp"
+#include "ds4_pool.hpp"
 
 #include "ggml-cpu.h"
 #include "strata/kernels/cpu/expert_layout.hpp"
@@ -49,6 +50,9 @@ static void fill_blocks(uint8_t* w, size_t bytes, int type, uint64_t seed) {
     }
 }
 
+// --per N: the engine's call shape (N experts a call through its
+// spinning Pool, h quantized on the calling thread, as cpu_experts_iq)
+static int g_per = 0;
 static int run_expert(int tg, int td, int threads, long mb, int nt, int reps) {
     ggml_cpu_init();
     const int E = 5120, FF = 2304;
@@ -81,6 +85,49 @@ static int run_expert(int tg, int td, int threads, long mb, int nt, int reps) {
             th.emplace_back([&] { for (;;) { const long j = cur.fetch_add(1); if (j >= njobs) break; fn(j); } });
         for (auto& t : th) t.join();
     };
+    strata::ds4::Pool pool(std::max(0, threads - 1), {}, 20000);
+    auto pass_per = [&]() {
+        const int gb = (FF + RB - 1) / RB, db = (E + RB - 1) / RB;
+        double best = 1e30;
+        for (int r = 0; r < reps + 1; ++r) {
+            const auto t0 = clk::now();
+            for (int e0 = 0; e0 < ne; e0 += g_per) {
+                const int n = std::min(g_per, ne - e0);
+                // (the pool keeps a reference: the jobs outlive start)
+                const std::function<void(int)> fg = [&](int j) {
+                    const int e = e0 + j / gb, r0 = (j % gb) * RB, r1 = std::min(FF, r0 + RB);
+                    const void* ap[64];
+                    float* hp[64];
+                    for (int t = 0; t < nt; ++t) { ap[t] = act[(size_t) t].data(); hp[t] = &h[((size_t) e * nt + t) * FF]; }
+                    gg_cpu_gate_up(f, &gw[(size_t) e * gbytes], &uw[(size_t) e * gbytes], ap, nt, hp, r0, r1, 10.0f);
+                };
+                pool.start(n * gb, fg);
+                pool.help();
+                pool.wait();
+                for (int j = e0 * nt; j < (e0 + n) * nt; ++j)
+                    gg_cpu_quant(f.d_act, &h[(size_t) j * FF], FF, &hq[(size_t) j * f.h_bytes]);
+                const std::function<void(int)> fd = [&](int j) {
+                    const int e = e0 + j / db, r0 = (j % db) * RB, r1 = std::min(E, r0 + RB);
+                    const void* hp[64];
+                    float* yp[64];
+                    for (int t = 0; t < nt; ++t) { hp[t] = &hq[((size_t) e * nt + t) * f.h_bytes]; yp[t] = &y[((size_t) e * nt + t) * E]; }
+                    gg_cpu_down(f, &dw[(size_t) e * dbytes], hp, nt, yp, r0, r1);
+                };
+                pool.start(n * db, fd);
+                pool.help();
+                pool.wait();
+            }
+            if (r > 0) best = std::min(best, secs(t0));
+        }
+        return best;
+    };
+    if (g_per > 0) {
+        gg_cpu_set_iq256(2);
+        const double t = pass_per(), gbs = (double) ne * ebytes / 1e9;
+        std::printf("expert gate/up %d down %d nt %d threads %d, %d a call: %d experts | %.3f s = %.1f GB/s, %.3f ms an expert\n",
+                    tg, td, nt, threads, g_per, ne, t, gbs / t, 1e3 * t / ne);
+        return 0;
+    }
     auto pass = [&](int mode) {
         gg_cpu_set_iq256(mode);
         double best = 1e30;
@@ -137,6 +184,7 @@ int main(int argc, char** argv) {
         else if (a == "--reps") reps = (int) val();
         else if (a == "--exact") exact = true;
         else if (a == "--expert") expert = true;
+        else if (a == "--per") g_per = (int) val();
         else if (a == "--k512") k512 = true;
         else if (a == "--dtype") dtype = (int) val();
         else if (a == "--dump" && i + 1 < argc) dump = argv[++i];

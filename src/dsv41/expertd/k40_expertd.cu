@@ -175,6 +175,65 @@ __global__ void bp_convert_m(const uint8_t* raw, size_t ld, int k, int n, uint2*
             (uint16_t) ((s0 >> 12) | ((s1 >> 8) & 0x00f0u) | ((s2 >> 4) & 0x0f00u) | (s3 & 0xf000u));
     }
 }
+// IQ2_XXS rows -> 3 planes: q = -43 + 18 b0 + 17 b1 + 51 b2
+// (+8: b2; +25: b1 b2; +43: all; -43: none; -25: b0; -8: b0 b1)
+__global__ void bp_convert_x(const uint8_t* raw, size_t ld, int k, int n, uint2* pl, uint32_t* p2, uint16_t* mt,
+                             uint16_t* dh) {
+    const int nsb = k / 32;
+    const size_t s = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= (size_t) n * nsb) return;
+    const int row = (int) (s / nsb), kb = (int) (s % nsb), ib = kb & 7;
+    const uint8_t* b = raw + (size_t) row * ld + (size_t) (kb >> 3) * 66;
+    const uint8_t* q = b + 2 + 8 * ib;
+    const uint32_t a0 = q[0] | (q[1] << 8) | (q[2] << 16) | ((uint32_t) q[3] << 24);
+    const uint32_t a1 = q[4] | (q[5] << 8) | (q[6] << 16) | ((uint32_t) q[7] << 24);
+    uint32_t m0 = 0, m1 = 0, m2 = 0;
+    for (int l = 0; l < 4; ++l) {
+        const uint64_t g = iq2xxs_grid[(a0 >> (8 * l)) & 255u];
+        const uint32_t sg = ksigns_iq2xs[(a1 >> (7 * l)) & 127u];
+        for (int j = 0; j < 8; ++j) {
+            const uint32_t mag = (uint32_t) (g >> (8 * j)) & 255u, bit = 1u << (8 * l + j);
+            const bool neg = (sg >> j) & 1u;
+            const uint32_t c = !neg ? (mag == 8 ? 4u : mag == 25 ? 6u : 7u) : (mag == 43 ? 0u : mag == 25 ? 1u : 3u);
+            if (c & 1u) m0 |= bit;
+            if (c & 2u) m1 |= bit;
+            if (c & 4u) m2 |= bit;
+        }
+    }
+    pl[s] = make_uint2(m0, m1);
+    p2[s] = m2;
+    mt[s] = (uint16_t) (a1 >> 28);
+    if (ib == 0) dh[(size_t) row * (nsb / 8) + (kb >> 3)] = (uint16_t) (b[0] | (b[1] << 8));
+}
+// IQ2_S rows -> the same 3 planes (bp_convert_x's code); meta:
+// s0 (bits 0-3, values 0..15) and s1 (bits 4-7, 16..31)
+__global__ void bp_convert_s(const uint8_t* raw, size_t ld, int k, int n, uint2* pl, uint32_t* p2, uint16_t* mt,
+                             uint16_t* dh) {
+    const int nsb = k / 32;
+    const size_t s = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= (size_t) n * nsb) return;
+    const int row = (int) (s / nsb), kb = (int) (s % nsb), ib = kb & 7;
+    const uint8_t* b = raw + (size_t) row * ld + (size_t) (kb >> 3) * 82;
+    const uint8_t* qs = b + 2;
+    const uint32_t h = b[66 + ib], sc = b[74 + ib];
+    uint32_t m0 = 0, m1 = 0, m2 = 0;
+    for (int l = 0; l < 4; ++l) {
+        const uint64_t g = iq2s_grid[qs[4 * ib + l] | ((h << (8 - 2 * l)) & 0x300u)];
+        const uint32_t sg = qs[32 + 4 * ib + l];
+        for (int j = 0; j < 8; ++j) {
+            const uint32_t mag = (uint32_t) (g >> (8 * j)) & 255u, bit = 1u << (8 * l + j);
+            const bool neg = (sg >> j) & 1u;
+            const uint32_t c = !neg ? (mag == 8 ? 4u : mag == 25 ? 6u : 7u) : (mag == 43 ? 0u : mag == 25 ? 1u : 3u);
+            if (c & 1u) m0 |= bit;
+            if (c & 2u) m1 |= bit;
+            if (c & 4u) m2 |= bit;
+        }
+    }
+    pl[s] = make_uint2(m0, m1);
+    p2[s] = m2;
+    mt[s] = (uint16_t) sc;
+    if (ib == 0) dh[(size_t) row * (nsb / 8) + (kb >> 3)] = (uint16_t) (b[0] | (b[1] << 8));
+}
 // rows of int8 (k each) -> 8 bit planes a sub-block, its sum,
 // and its 4 groups' sums (s8, for IQ1_M's per-8 deltas)
 __global__ void bp_xplanes(const int8_t* xq, int k, int rows, uint32_t* xp, int* xs, int* s8) {
@@ -203,8 +262,21 @@ struct BpJob {
     const float* xd;
     float* y;
     int k, n;
-    const int* s8;   // (IQ1_M: the groups' sums)
+    const int* s8;        // (IQ1_M: the groups' sums)
+    const uint32_t* p2;   // (IQ2_XXS: the third plane)
 };
+// sum over t of c_t popc(m & X_t), c_t = 2^t, c_7 = -128
+__device__ __forceinline__ int bp_w1(uint32_t m, uint4 xa, uint4 xb) {
+    int W = __popc(m & xa.x);
+    W += __popc(m & xa.y) << 1;
+    W += __popc(m & xa.z) << 2;
+    W += __popc(m & xa.w) << 3;
+    W += __popc(m & xb.x) << 4;
+    W += __popc(m & xb.y) << 5;
+    W += __popc(m & xb.z) << 6;
+    W -= __popc(m & xb.w) << 7;
+    return W;
+}
 __device__ __forceinline__ int bp_w(uint2 pm, uint4 xa, uint4 xb) {
     int W = (__popc(pm.x & xa.x) - __popc(pm.y & xa.x));
     W += (__popc(pm.x & xa.y) - __popc(pm.y & xa.y)) << 1;
@@ -287,6 +359,80 @@ __global__ void __launch_bounds__(256) bp_mv_m(const BpJob* __restrict__ jobs) {
     for (int o = P / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
     if (lane == 0 && live) J.y[row] = acc;
 }
+// IQ2_XXS: mv's d s0 L, L = -43 S + 18 W0 + 17 W1 + 51 W2 (an
+// exact integer; s0 = s1 for this type)
+template <int P>
+__global__ void __launch_bounds__(256) bp_mv_x(const BpJob* __restrict__ jobs) {
+    const BpJob J = jobs[blockIdx.y];
+    const int lane = threadIdx.x & (P - 1);
+    const int row = blockIdx.x * (256 / P) + (int) threadIdx.x / P;
+    const int nsb = J.k / 32;
+    const bool live = row < J.n;
+    float acc = 0.0f;
+    if (live) {
+        const uint2* p = J.pl + (size_t) row * nsb + lane;
+        const uint32_t* q = J.p2 + (size_t) row * nsb + lane;
+        const uint16_t* m = J.mt + (size_t) row * nsb + lane;
+        const uint16_t* dr = J.dh + (size_t) row * (nsb / 8);
+        const uint4* xv = (const uint4*) J.xp + 2 * lane;
+        const int* sv = J.xs + lane;
+        const float* dv = J.xd + lane;
+        for (int kb = lane; kb < nsb; kb += P) {
+            const uint4 xa = __ldg(xv), xb = __ldg(xv + 1);
+            const uint2 pm = __ldg(p);
+            const uint32_t m2 = __ldg(q), mt = __ldg(m);
+            const int S = __ldg(sv);
+            const float dx = __ldg(dv);
+            const float d = __half2float(__ushort_as_half(__ldg(dr + (kb >> 3)))) * 0.125f;
+            const int L = -43 * S + 18 * bp_w1(pm.x, xa, xb) + 17 * bp_w1(pm.y, xa, xb) + 51 * bp_w1(m2, xa, xb);
+            const int s0 = 2 * (int) (mt & 15u) + 1;
+            acc = fmaf(dx, __fmul_rn(d, (float) (s0 * L)), acc);
+            p += P; q += P; m += P; xv += 2 * P; sv += P; dv += P;
+        }
+    }
+#pragma unroll
+    for (int o = P / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0 && live) J.y[row] = acc;
+}
+// IQ2_S: mv's d (s0 lo + s1 hi), each half -43 S + 18 W0 +
+// 17 W1 + 51 W2 over its 16 values (the groups' sums give S)
+template <int P>
+__global__ void __launch_bounds__(256) bp_mv_s(const BpJob* __restrict__ jobs) {
+    const BpJob J = jobs[blockIdx.y];
+    const int lane = threadIdx.x & (P - 1);
+    const int row = blockIdx.x * (256 / P) + (int) threadIdx.x / P;
+    const int nsb = J.k / 32;
+    const bool live = row < J.n;
+    float acc = 0.0f;
+    if (live) {
+        const uint2* p = J.pl + (size_t) row * nsb + lane;
+        const uint32_t* q = J.p2 + (size_t) row * nsb + lane;
+        const uint16_t* m = J.mt + (size_t) row * nsb + lane;
+        const uint16_t* dr = J.dh + (size_t) row * (nsb / 8);
+        const uint4* xv = (const uint4*) J.xp + 2 * lane;
+        const int4* sv = (const int4*) J.s8 + lane;
+        const float* dv = J.xd + lane;
+        for (int kb = lane; kb < nsb; kb += P) {
+            const uint4 xa = __ldg(xv), xb = __ldg(xv + 1);
+            const uint2 pm = __ldg(p);
+            const uint32_t m2 = __ldg(q), mt = __ldg(m);
+            const int4 S = __ldg(sv);
+            const float dx = __ldg(dv);
+            const float d = __half2float(__ushort_as_half(__ldg(dr + (kb >> 3)))) * 0.125f;
+            const uint32_t L16 = 0xffffu, H16 = 0xffff0000u;
+            const int lo = -43 * (S.x + S.y) + 18 * bp_w1(pm.x & L16, xa, xb) + 17 * bp_w1(pm.y & L16, xa, xb) +
+                           51 * bp_w1(m2 & L16, xa, xb);
+            const int hi = -43 * (S.z + S.w) + 18 * bp_w1(pm.x & H16, xa, xb) + 17 * bp_w1(pm.y & H16, xa, xb) +
+                           51 * bp_w1(m2 & H16, xa, xb);
+            const int s0 = 2 * (int) (mt & 15u) + 1, s1 = 2 * (int) ((mt >> 4) & 15u) + 1;
+            acc = fmaf(dx, __fmul_rn(d, (float) (s0 * lo + s1 * hi)), acc);
+            p += P; q += P; m += P; xv += 2 * P; sv += P; dv += P;
+        }
+    }
+#pragma unroll
+    for (int o = P / 2; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+    if (lane == 0 && live) J.y[row] = acc;
+}
 // y[t] = sum of w[p] part[p] over the pairs p of token t
 __global__ void wsum(const float* part, const xp::Pair* pairs, int np, int n, float* y) {
     const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -321,15 +467,17 @@ static bool recv_all(int fd, void* p, size_t n) {
 
 // ------------------------------------------------ the server
 struct LayerW {
-    bool ok = false;   // gate, up and down all IQ1_S, n_embd x n_ff
+    bool ok = false;   // gate, up and down types the daemon takes
     const Tensor *g = nullptr, *u = nullptr, *d = nullptr;
+    size_t off[3] = {}, per = 0;   // (its matrices in a slot; size)
 };
-struct Mat {   // IQ1_S as bit planes (bp_convert's), else raw
+struct Mat {   // IQ1_S / IQ1_M / IQ2_XXS as bit planes, else raw
     uint2* pl;
     uint16_t *mt, *dh;
     int type = iq::kIQ1_S;
     const uint8_t* raw = nullptr;   // (raw: for iq::mv)
     size_t ld = 0;
+    uint32_t* p2 = nullptr;         // (IQ2_XXS: the third plane)
 };
 struct Held {
     Mat g, u, d;
@@ -341,14 +489,37 @@ struct Loader {
     uint8_t* stage = nullptr;
     cudaStream_t s = nullptr;
 };
-// bytes of an n x k matrix's planes, meta and d, in that order
-static size_t bp_bytes(int k, int n) { return (size_t) n * (k / 32) * 10 + (size_t) n * (k / 256) * 2; }
-static Mat bp_at(uint8_t* base, int k, int n) {
-    const size_t s = (size_t) n * (k / 32);
-    return {(uint2*) base, (uint16_t*) (base + s * 8), (uint16_t*) (base + s * 10)};
+// bytes of an n x k matrix's planes (2, IQ2_XXS 3), meta and d
+static bool three_planes(int t) { return t == iq::kIQ2_XXS || t == iq::kIQ2_S; }
+static size_t bp_bytes(int k, int n, int type = iq::kIQ1_S) {
+    return (size_t) n * (k / 32) * (three_planes(type) ? 14 : 10) + (size_t) n * (k / 256) * 2;
 }
-// the types kept as bit planes (the ternary ones)
-static bool is_bp(int t) { return t == iq::kIQ1_S || t == iq::kIQ1_M; }
+static Mat bp_at(uint8_t* base, int k, int n, int type = iq::kIQ1_S) {
+    const size_t s = (size_t) n * (k / 32);
+    Mat m{(uint2*) base, nullptr, nullptr};
+    m.type = type;
+    if (three_planes(type)) {
+        m.p2 = (uint32_t*) (base + s * 8);
+        m.mt = (uint16_t*) (base + s * 12);
+        m.dh = (uint16_t*) (base + s * 14);
+    } else {
+        m.mt = (uint16_t*) (base + s * 8);
+        m.dh = (uint16_t*) (base + s * 10);
+    }
+    return m;
+}
+// the types kept as bit planes: every expert type this pack has
+static bool is_bp(int t) {
+    return t == iq::kIQ1_S || t == iq::kIQ1_M || t == iq::kIQ2_XXS || t == iq::kIQ2_S;
+}
+static void bp_convert_any(int type, const uint8_t* raw, size_t ld, int k, int n, const Mat& m, cudaStream_t s) {
+    const size_t ns = (size_t) n * (k / 32);
+    const unsigned g = (unsigned) ((ns + 255) / 256);
+    if (type == iq::kIQ1_S) bp_convert<<<g, 256, 0, s>>>(raw, ld, k, n, m.pl, m.mt, m.dh);
+    else if (type == iq::kIQ1_M) bp_convert_m<<<g, 256, 0, s>>>(raw, ld, k, n, m.pl, m.mt, m.dh);
+    else if (type == iq::kIQ2_XXS) bp_convert_x<<<g, 256, 0, s>>>(raw, ld, k, n, m.pl, m.p2, m.mt, m.dh);
+    else bp_convert_s<<<g, 256, 0, s>>>(raw, ld, k, n, m.pl, m.p2, m.mt, m.dh);
+}
 static Mat raw_at(uint8_t* base, int type, int k) {
     Mat m{nullptr, nullptr, nullptr};
     m.type = type;
@@ -357,7 +528,11 @@ static Mat raw_at(uint8_t* base, int type, int k) {
     return m;
 }
 
-constexpr int kJobRegions = 4, kJobsRegion = 2 * xp::kMaxPairs;
+// job regions: gate/up IQ1_S, IQ1_M, IQ2_XXS, IQ2_S; then down
+constexpr int kJobRegions = 8, kJobsRegion = 2 * xp::kMaxPairs;
+static int region(int type, bool down) {
+    return (down ? 4 : 0) + (type == iq::kIQ1_S ? 0 : type == iq::kIQ1_M ? 1 : type == iq::kIQ2_XXS ? 2 : 3);
+}
 
 struct Server {
     std::map<std::string, Tensor> idx;
@@ -380,6 +555,7 @@ struct Server {
     uint32_t *xpl = nullptr, *hpl = nullptr;   // x / h bit planes
     int *xsum = nullptr, *hsum = nullptr, *xs8 = nullptr, *hs8 = nullptr;
     BpJob *hjobs = nullptr, *djobs = nullptr;   // pinned / device
+    std::vector<BpJob> rj[8];                   // (a request's jobs by region)
     cudaStream_t s = nullptr;
 
     void setup_layers() {
@@ -400,15 +576,19 @@ struct Server {
             const Tensor* t3[3] = {L.g, L.u, L.d};
             for (int r = 0; r < 3; ++r) {
                 const int k = r < 2 ? dim : ff, n = r < 2 ? ff : dim;
-                slot_mat = std::max(slot_mat, is_bp(t3[r]->type) ? bp_bytes(k, n) : iq::row_bytes(t3[r]->type, k) * n);
+                const int ty = t3[r]->type;
+                const size_t sz = use_bp(ty) ? bp_bytes(k, n, ty) : iq::row_bytes(ty, k) * n;
+                L.off[r] = L.per;
+                L.per += (sz + 255) / 256 * 256;
                 raw_max = std::max(raw_max, iq::row_bytes(t3[r]->type, k) * n);
             }
         }
-        slot_mat = (slot_mat + 255) / 256 * 256;
     }
-    size_t slot_mat = 0, raw_max = 0;   // (a matrix's slot, its largest raw form)
-    // an expert from the files into dst (an arena slot, three
-    // slot_mat parts): IQ1_S as bit planes, others raw; then held
+    size_t raw_max = 0;   // (the largest raw matrix)
+    bool bp_iq2 = true;                 // (--raw-iq2: IQ2_XXS raw, smaller slots)
+    bool use_bp(int t) const { return is_bp(t) && (t != iq::kIQ2_XXS || bp_iq2); }
+    // an expert from the files into dst (its layer's per bytes):
+    // the bit-plane types converted, others raw; then held
     bool load_one(int blk, int e, uint8_t* dst, Loader& ld) {
         if (blk >= (int) layers.size() || !layers[(size_t) blk].ok || (uint64_t) e >= layers[(size_t) blk].g->dims[2])
             return false;
@@ -426,18 +606,11 @@ struct Server {
             const ssize_t got = pread(fd, ld.host.data(), sz, (off_t) (t3[r]->off + (uint64_t) e * sz));
             close(fd);
             if (got != (ssize_t) sz) return false;
-            uint8_t* part = dst + (size_t) r * slot_mat;
-            if (is_bp(ty)) {
+            uint8_t* part = dst + L.off[r];
+            if (use_bp(ty)) {
                 CK(cudaMemcpyAsync(ld.stage, ld.host.data(), sz, cudaMemcpyHostToDevice, ld.s));
-                *m3[r] = bp_at(part, k, n);
-                m3[r]->type = ty;
-                const size_t ns = (size_t) n * (k / 32);
-                if (ty == iq::kIQ1_S)
-                    bp_convert<<<(unsigned) ((ns + 255) / 256), 256, 0, ld.s>>>(ld.stage, ld_r, k, n, m3[r]->pl,
-                                                                                m3[r]->mt, m3[r]->dh);
-                else
-                    bp_convert_m<<<(unsigned) ((ns + 255) / 256), 256, 0, ld.s>>>(ld.stage, ld_r, k, n, m3[r]->pl,
-                                                                                  m3[r]->mt, m3[r]->dh);
+                *m3[r] = bp_at(part, k, n, ty);
+                bp_convert_any(ty, ld.stage, ld_r, k, n, *m3[r], ld.s);
             } else {
                 CK(cudaMemcpyAsync(part, ld.host.data(), sz, cudaMemcpyHostToDevice, ld.s));
                 *m3[r] = raw_at(part, ty, k);
@@ -465,8 +638,10 @@ struct Server {
             const auto t0 = std::chrono::steady_clock::now();
             uint8_t* slot = nullptr;
             bool have_in = false;
+            // (a slot fits only an expert of the same size)
             const bool can = sw.in.blk < layers.size() && layers[sw.in.blk].ok &&
-                             sw.in.e < layers[sw.in.blk].g->dims[2];
+                             sw.in.e < layers[sw.in.blk].g->dims[2] && sw.out.blk < layers.size() &&
+                             layers[sw.out.blk].per == layers[sw.in.blk].per;
             if (can) {
                 std::lock_guard<std::mutex> lk(mu);
                 auto it = held.find((uint32_t) sw.out.blk << 16 | sw.out.e);
@@ -494,38 +669,49 @@ struct Server {
     // the candidates in rank order, while memory lasts
     std::vector<xp::Id> assign(const std::vector<xp::Id>& want, size_t reserve) {
         std::vector<xp::Id> got;
-        const size_t per = 3 * slot_mat;
         size_t fr = 0, tot = 0;
         CK(cudaMemGetInfo(&fr, &tot));
-        const size_t budget = fr > reserve ? fr - reserve : 0;
-        const size_t n_max = budget / per;
-        std::vector<xp::Id> ok;
-        for (const xp::Id& w : want)
-            if (w.blk < layers.size() && layers[w.blk].ok && w.e < layers[w.blk].g->dims[2] &&
-                ok.size() < n_max)
-                ok.push_back(w);
-        // one arena per 256 experts (smaller allocations)
+        size_t budget = fr > reserve ? fr - reserve : 0, used = 0;
+        // slots of each layer's own size, carved from 256 MB arenas
+        constexpr size_t kArena = (size_t) 256 << 20;
+        uint8_t* ar = nullptr;
+        size_t ar_left = 0;
         loader_init(boot);
         const auto t0 = std::chrono::steady_clock::now();
-        for (size_t a = 0; a < ok.size(); a += 256) {
-            const size_t n = std::min<size_t>(256, ok.size() - a);
-            uint8_t* ar = nullptr;
-            if (cudaMalloc(&ar, n * per) != cudaSuccess) break;
-            arenas.push_back(ar);
-            for (size_t i = 0; i < n; ++i)
-                if (load_one(ok[a + i].blk, ok[a + i].e, ar + i * per, boot)) got.push_back(ok[a + i]);
+        for (const xp::Id& w : want) {
+            if (w.blk >= layers.size() || !layers[w.blk].ok || w.e >= layers[w.blk].g->dims[2]) continue;
+            const size_t per = layers[w.blk].per;
+            if (per > ar_left) {
+                const size_t sz = std::max(kArena, per);
+                if (sz > budget || cudaMalloc(&ar, sz) != cudaSuccess) break;
+                budget -= sz;
+                arenas.push_back(ar);
+                ar_left = sz;
+            }
+            if (load_one(w.blk, w.e, ar, boot)) {
+                got.push_back(w);
+                used += per;
+            }
+            ar += per;
+            ar_left -= per;
         }
         const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "k40_expertd: holding %zu of %zu candidates (%.2f GB) in %.1f s\n", got.size(),
-                     want.size(), got.size() * per / 1e9, s);
+                     want.size(), used / 1e9, s);
         return got;
     }
+    // the request, then its job tables (one upload of both)
+    size_t in_max = 0;
     void alloc_scratch() {
-        const size_t in_max = sizeof(xp::ComputeHdr) + (size_t) xp::kMaxT * (dim + dim / 8) +
-                              (size_t) xp::kMaxPairs * sizeof(xp::Pair);
-        CK(cudaMallocHost(&pin, in_max));
+        in_max = sizeof(xp::ComputeHdr) + (size_t) xp::kMaxT * (dim + dim / 8) + (size_t) xp::kMaxPairs * sizeof(xp::Pair);
+        in_max = (in_max + 255) / 256 * 256;
+        const size_t jobs = (size_t) kJobRegions * kJobsRegion * sizeof(BpJob);
+        CK(cudaMallocHost(&pin, in_max + jobs));
         CK(cudaMallocHost(&pout, (size_t) xp::kMaxT * dim * 4));
-        CK(cudaMalloc(&din, in_max));
+        CK(cudaMalloc(&din, in_max + jobs));
+        hjobs = (BpJob*) (pin + in_max);
+        djobs = (BpJob*) (din + in_max);
+        for (int i = 0; i < 6; ++i) CK(cudaEventCreate(&pev[i]));
         CK(cudaMalloc(&dgu, (size_t) xp::kMaxPairs * 2 * ff * 4));
         CK(cudaMalloc(&dh, (size_t) xp::kMaxPairs * ff));
         CK(cudaMalloc(&dhd, (size_t) xp::kMaxPairs * ff / 8));
@@ -537,9 +723,30 @@ struct Server {
         CK(cudaMalloc(&hsum, (size_t) xp::kMaxPairs * (ff / 32) * 4));
         CK(cudaMalloc(&xs8, (size_t) xp::kMaxT * (dim / 32) * 16));
         CK(cudaMalloc(&hs8, (size_t) xp::kMaxPairs * (ff / 32) * 16));
-        CK(cudaMallocHost(&hjobs, (size_t) kJobRegions * kJobsRegion * sizeof(BpJob)));
-        CK(cudaMalloc(&djobs, (size_t) kJobRegions * kJobsRegion * sizeof(BpJob)));
         CK(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking));
+    }
+    // K40_PROF=1: each request's phases by its pick count (1, 2,
+    // 3, 4+), averaged every 2000 requests
+    const bool prof = std::getenv("K40_PROF") != nullptr;
+    cudaEvent_t pev[6] = {};
+    double pacc[4][7] = {};
+    long preq = 0;
+    void prof_add(int np, double host_us) {
+        float ms[5];
+        for (int i = 0; i < 5; ++i) CK(cudaEventElapsedTime(&ms[i], pev[i], pev[i + 1]));
+        double* a = pacc[std::min(np, 4) - 1];
+        for (int i = 0; i < 5; ++i) a[i] += 1e3 * ms[i];
+        a[5] += host_us;
+        a[6] += 1;
+        if (++preq % 2000 != 0) return;
+        for (int b = 0; b < 4; ++b) {
+            double* q = pacc[b];
+            if (q[6] == 0) continue;
+            std::fprintf(stderr, "k40 prof picks %d%s: %.0f requests, us: upload %.0f, gate/up %.0f, swiglu %.0f, down %.0f, "
+                         "download %.0f, host total %.0f\n", b + 1, b == 3 ? "+" : "", q[6], q[0] / q[6], q[1] / q[6],
+                         q[2] / q[6], q[3] / q[6], q[4] / q[6], q[5] / q[6]);
+            for (int i = 0; i < 7; ++i) q[i] = 0;
+        }
     }
     // one request: false drops the connection
     bool compute(int fd, const xp::ComputeHdr& h) {
@@ -550,14 +757,18 @@ struct Server {
         const auto t0 = std::chrono::steady_clock::now();
         const xp::Pair* pairs = (const xp::Pair*) (pin + xbytes + dbytes);
         xp::ReplyHdr rh{h.seq, 0u, 0u};
-        // jobs: bit-plane regions (gate/up IQ1_S, IQ1_M; down IQ1_S,
-        // IQ1_M), and the raw ones for iq::mv (jg, jd)
+        // jobs: the bit-plane regions (region()), and the raw ones
+        // for iq::mv (jg, jd)
         const int nsx = dim / 32, nsh = ff / 32;
         const float* xd_dev = (const float*) (din + xbytes);
         const int8_t* xq_dev = (const int8_t*) din;
         int nr[kJobRegions] = {};
         std::vector<iq::MvJob> jg, jd;
-        auto put = [&](int reg, const BpJob& j) { hjobs[(size_t) reg * kJobsRegion + nr[reg]++] = j; };
+        for (auto& v : rj) v.clear();
+        auto put = [&](int reg, const BpJob& j) {
+            rj[reg].push_back(j);
+            ++nr[reg];
+        };
         std::unique_lock<std::mutex> lk(mu);   // (the lookups only)
         for (int p = 0; p < h.np; ++p) {
             const auto it = held.find((uint32_t) h.blk << 16 | pairs[p].e);
@@ -568,9 +779,9 @@ struct Server {
                 const Mat& M = r ? it->second.u : it->second.g;
                 float* y = dgu + (size_t) p * 2 * ff + (size_t) r * ff;
                 if (M.raw == nullptr) {
-                    put(M.type == iq::kIQ1_S ? 0 : 1,
+                    put(region(M.type, false),
                         {M.pl, M.mt, M.dh, xpl + (size_t) t * nsx * 8, xsum + (size_t) t * nsx, xd_dev + (size_t) t * nsx,
-                         y, dim, ff, xs8 + (size_t) t * nsx * 4});
+                         y, dim, ff, xs8 + (size_t) t * nsx * 4, M.p2});
                 } else {
                     iq::MvJob j;
                     j.w = M.raw; j.ld = M.ld; j.type = M.type; j.k = dim; j.n = ff;
@@ -581,9 +792,9 @@ struct Server {
             const Mat& D = it->second.d;
             float* y = dpart + (size_t) p * dim;
             if (D.raw == nullptr) {
-                put(D.type == iq::kIQ1_S ? 2 : 3,
+                put(region(D.type, true),
                     {D.pl, D.mt, D.dh, hpl + (size_t) p * nsh * 8, hsum + (size_t) p * nsh, dhd + (size_t) p * nsh, y, ff,
-                     dim, hs8 + (size_t) p * nsh * 4});
+                     dim, hs8 + (size_t) p * nsh * 4, D.p2});
             } else {
                 iq::MvJob j;
                 j.w = D.raw; j.ld = D.ld; j.type = D.type; j.k = ff; j.n = dim;
@@ -592,27 +803,47 @@ struct Server {
             }
         }
         lk.unlock();
-        CK(cudaMemcpyAsync(din, pin, xbytes + dbytes + pbytes, cudaMemcpyHostToDevice, s));
-        for (int g = 0; g < kJobRegions; ++g)
-            if (nr[g] > 0)
-                CK(cudaMemcpyAsync(djobs + (size_t) g * kJobsRegion, hjobs + (size_t) g * kJobsRegion,
-                                   (size_t) nr[g] * sizeof(BpJob), cudaMemcpyHostToDevice, s));
-        if (nr[0] + nr[1] > 0) bp_xplanes<<<(unsigned) ((nsx * h.T + 7) / 8), 256, 0, s>>>(xq_dev, dim, h.T, xpl, xsum, xs8);
-        if (nr[0] > 0) bp_mv<32><<<dim3((unsigned) ((ff + 7) / 8), nr[0]), 256, 0, s>>>(djobs);
-        if (nr[1] > 0) bp_mv_m<32><<<dim3((unsigned) ((ff + 7) / 8), nr[1]), 256, 0, s>>>(djobs + kJobsRegion);
+        // one upload: the request, then the job tables packed right
+        // after it (region g at base[g])
+        const size_t joff = (xbytes + dbytes + pbytes + 15) / 16 * 16;
+        size_t base[kJobRegions], nj = 0;
+        for (int g = 0; g < kJobRegions; ++g) {
+            base[g] = nj;
+            std::memcpy(pin + joff + nj * sizeof(BpJob), rj[g].data(), rj[g].size() * sizeof(BpJob));
+            nj += rj[g].size();
+        }
+        if (prof) CK(cudaEventRecord(pev[0], s));
+        CK(cudaMemcpyAsync(din, pin, joff + nj * sizeof(BpJob), cudaMemcpyHostToDevice, s));
+        if (prof) CK(cudaEventRecord(pev[1], s));
+        const BpJob* J0 = (const BpJob*) (din + joff);
+        const dim3 gu((unsigned) ((ff + 7) / 8)), dn((unsigned) ((dim + 31) / 32));
+        if (nr[0] + nr[1] + nr[2] + nr[3] > 0)
+            bp_xplanes<<<(unsigned) ((nsx * h.T + 7) / 8), 256, 0, s>>>(xq_dev, dim, h.T, xpl, xsum, xs8);
+        if (nr[0] > 0) bp_mv<32><<<dim3(gu.x, nr[0]), 256, 0, s>>>(J0 + base[0]);
+        if (nr[1] > 0) bp_mv_m<32><<<dim3(gu.x, nr[1]), 256, 0, s>>>(J0 + base[1]);
+        if (nr[2] > 0) bp_mv_x<32><<<dim3(gu.x, nr[2]), 256, 0, s>>>(J0 + base[2]);
+        if (nr[3] > 0) bp_mv_s<32><<<dim3(gu.x, nr[3]), 256, 0, s>>>(J0 + base[3]);
         for (size_t a = 0; a < jg.size(); a += 64)
             if (!iq::mv(jg.data() + a, (int) std::min<size_t>(64, jg.size() - a), s)) return false;
+        if (prof) CK(cudaEventRecord(pev[2], s));
         swiglu_q8<<<dim3((unsigned) (ff / 32 / 8), h.np), dim3(32, 8), 0, s>>>(dgu, ff, lim, dh, dhd);
-        if (nr[2] + nr[3] > 0) bp_xplanes<<<(unsigned) ((nsh * h.np + 7) / 8), 256, 0, s>>>(dh, ff, h.np, hpl, hsum, hs8);
-        if (nr[2] > 0) bp_mv<8><<<dim3((unsigned) ((dim + 31) / 32), nr[2]), 256, 0, s>>>(djobs + 2 * kJobsRegion);
-        if (nr[3] > 0) bp_mv_m<8><<<dim3((unsigned) ((dim + 31) / 32), nr[3]), 256, 0, s>>>(djobs + 3 * kJobsRegion);
+        if (prof) CK(cudaEventRecord(pev[3], s));
+        if (nr[4] + nr[5] + nr[6] + nr[7] > 0)
+            bp_xplanes<<<(unsigned) ((nsh * h.np + 7) / 8), 256, 0, s>>>(dh, ff, h.np, hpl, hsum, hs8);
+        if (nr[4] > 0) bp_mv<8><<<dim3(dn.x, nr[4]), 256, 0, s>>>(J0 + base[4]);
+        if (nr[5] > 0) bp_mv_m<8><<<dim3(dn.x, nr[5]), 256, 0, s>>>(J0 + base[5]);
+        if (nr[6] > 0) bp_mv_x<8><<<dim3(dn.x, nr[6]), 256, 0, s>>>(J0 + base[6]);
+        if (nr[7] > 0) bp_mv_s<8><<<dim3(dn.x, nr[7]), 256, 0, s>>>(J0 + base[7]);
         for (size_t a = 0; a < jd.size(); a += 64)
             if (!iq::mv(jd.data() + a, (int) std::min<size_t>(64, jd.size() - a), s)) return false;
         const xp::Pair* dpairs = (const xp::Pair*) (din + xbytes + dbytes);
         wsum<<<dim3((unsigned) ((dim + 255) / 256), h.T), 256, 0, s>>>(dpart, dpairs, h.np, dim, dy);
+        if (prof) CK(cudaEventRecord(pev[4], s));
         CK(cudaMemcpyAsync(pout, dy, (size_t) h.T * dim * 4, cudaMemcpyDeviceToHost, s));
+        if (prof) CK(cudaEventRecord(pev[5], s));
         CK(cudaStreamSynchronize(s));
         rh.us = (uint32_t) std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count();
+        if (prof && h.T == 1) prof_add(h.np, (double) rh.us);
         if (!send_all(fd, &rh, sizeof(rh))) return false;
         for (int t = 0; t < h.T; ++t)
             if ((rh.mask >> t) & 1u)
@@ -675,7 +906,7 @@ static int selftest(char** a) {
     const long long off = std::atoll(a[1]);
     const int type = std::atoi(a[2]), k = std::atoi(a[3]), n = std::atoi(a[4]), ne = std::atoi(a[5]);
     if (!is_bp(type)) { std::fprintf(stderr, "selftest: %s is kept raw\n", iq::name(type)); return 2; }
-    const size_t ld = iq::row_bytes(type, k), mat = ld * (size_t) n, bpb = bp_bytes(k, n);
+    const size_t ld = iq::row_bytes(type, k), mat = ld * (size_t) n, bpb = bp_bytes(k, n, type);
     const int nsb = k / 32;
     std::vector<uint8_t> w(mat * ne);
     const int fd = open(a[0], O_RDONLY);
@@ -702,11 +933,9 @@ static int selftest(char** a) {
     std::vector<iq::MvJob> js(ne);
     std::vector<BpJob> hj(ne);
     for (int e = 0; e < ne; ++e) {
-        Mat m = bp_at(dbp + bpb * e, k, n);
-        const size_t ns = (size_t) n * nsb;
-        if (type == iq::kIQ1_S) bp_convert<<<(unsigned) ((ns + 255) / 256), 256>>>(dw + mat * e, ld, k, n, m.pl, m.mt, m.dh);
-        else bp_convert_m<<<(unsigned) ((ns + 255) / 256), 256>>>(dw + mat * e, ld, k, n, m.pl, m.mt, m.dh);
-        hj[e] = {m.pl, m.mt, m.dh, dxp, dxs, dxd, dyb + (size_t) e * n, k, n, ds8};
+        Mat m = bp_at(dbp + bpb * e, k, n, type);
+        bp_convert_any(type, dw + mat * e, ld, k, n, m, 0);
+        hj[e] = {m.pl, m.mt, m.dh, dxp, dxs, dxd, dyb + (size_t) e * n, k, n, ds8, m.p2};
         iq::MvJob& j = js[e];
         j.w = dw + mat * e; j.ld = ld; j.type = type; j.k = k; j.n = n; j.xq = dxq; j.xd = dxd;
         j.y = dya + (size_t) e * n; j.ycs = n;
@@ -732,7 +961,9 @@ static int selftest(char** a) {
         const double tb = timed([&] {
             const dim3 g((unsigned) ((n + 256 / P - 1) / (256 / P)), ne);
             if (type == iq::kIQ1_S) { if (P == 32) bp_mv<32><<<g, 256>>>(dj); else bp_mv<8><<<g, 256>>>(dj); }
-            else { if (P == 32) bp_mv_m<32><<<g, 256>>>(dj); else bp_mv_m<8><<<g, 256>>>(dj); }
+            else if (type == iq::kIQ1_M) { if (P == 32) bp_mv_m<32><<<g, 256>>>(dj); else bp_mv_m<8><<<g, 256>>>(dj); }
+            else if (type == iq::kIQ2_XXS) { if (P == 32) bp_mv_x<32><<<g, 256>>>(dj); else bp_mv_x<8><<<g, 256>>>(dj); }
+            else { if (P == 32) bp_mv_s<32><<<g, 256>>>(dj); else bp_mv_s<8><<<g, 256>>>(dj); }
         });
         CK(cudaMemcpy(yb.data(), dyb, yb.size() * 4, cudaMemcpyDeviceToHost));
         size_t diff = 0;
@@ -751,15 +982,18 @@ int main(int argc, char** argv) {
     if (argc >= 8 && std::strcmp(argv[1], "--selftest") == 0) return selftest(argv + 2);
     std::string dir;
     int port = xp::kPort;
-    for (int i = 1; i + 1 < argc; i += 2) {
-        if (std::strcmp(argv[i], "--model") == 0) dir = argv[i + 1];
-        else if (std::strcmp(argv[i], "--port") == 0) port = std::atoi(argv[i + 1]);
+    bool raw_iq2 = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--model") == 0 && i + 1 < argc) dir = argv[++i];
+        else if (std::strcmp(argv[i], "--port") == 0 && i + 1 < argc) port = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--raw-iq2") == 0) raw_iq2 = true;
     }
     if (dir.empty()) {
-        std::fprintf(stderr, "usage: k40_expertd --model DIR_WITH_GGUF_SHARDS [--port %d]\n", xp::kPort);
+        std::fprintf(stderr, "usage: k40_expertd --model DIR_WITH_GGUF_SHARDS [--port %d] [--raw-iq2]\n", xp::kPort);
         return 2;
     }
     Server sv;
+    sv.bp_iq2 = !raw_iq2;
     DIR* dp = opendir(dir.c_str());
     if (dp == nullptr) { std::perror(dir.c_str()); return 1; }
     for (dirent* de; (de = readdir(dp)) != nullptr;) {

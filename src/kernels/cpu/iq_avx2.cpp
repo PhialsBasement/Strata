@@ -535,7 +535,9 @@ void iq256_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void*
     iq256_rows_v(iq256_variant(), type, w, row_bytes, n, act, nt, out, r0, r1);
 }
 
-bool iq256x_supported(int type) noexcept { return type == 16 || type == 17 || type == 18 || type == 21 || type == 22 || type == 29; }
+bool iq256x_supported(int type) noexcept {
+    return type == 16 || type == 17 || type == 18 || type == 19 || type == 21 || type == 22 || type == 29;
+}
 
 void iq256x_rows(int type, const uint8_t* w, size_t row_bytes, int n, const void* const* act, int nt, float* const* out,
                  int r0, int r1) {
