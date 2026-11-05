@@ -173,6 +173,29 @@ public:
     /// Cut d tokens at a out of the state (later ones move down a
     /// RoPE gap of d); false with err when the span cannot be cut.
     bool splice_out(int64_t a, int64_t d, std::string& err);
+    /// Appends tokens [s0, s0 + n) of a saved conversation (slot_save's
+    /// bytes) at pos(): their compressed rows moved to the new position
+    /// (the rings are not: read the span's last tokens again after it)
+    bool splice_in(const uint8_t* slot, size_t bytes, int64_t s0, int64_t n, std::string& err);
+    /// Tokens [a, a + d) become rep, the tokens after them kept (their
+    /// rows moved, positions as they were); rep and `seam` followers are
+    /// computed again from the latest checkpoint at or before a
+    bool splice_edit(int64_t a, int64_t d, const std::vector<int32_t>& rep, int64_t seam, std::string& err);
+    /// Several such edits at once (today's positions, not overlapping):
+    /// rows moved right to left, then the seams computed left to right
+    struct Edit {
+        int64_t a = 0, d = 0;
+        std::vector<int32_t> rep;
+    };
+    bool splice_edits(const std::vector<Edit>& es, int64_t seam, std::string& err);
+    /// The positions [a, a + d) holds (its tokens and the gaps among them)
+    int64_t edit_room(int64_t a, int64_t d) const;
+    /// The KV sources (research): count, tokens a row, layer, and a
+    /// source's compressed rows [r0, r0 + n) as F32 (n x head dim)
+    int kv_sources() const;
+    int kv_ratio(int s) const;
+    int kv_layer(int s) const;
+    bool kv_rows(int s, int64_t r0, int64_t n, std::vector<float>& out, std::string& err);
     /// What a cut's start and length must be a multiple of.
     int64_t splice_align() const;
     /// Tokens a cut must leave after it (the window ring's length).

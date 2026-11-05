@@ -55,7 +55,7 @@ inline bool read(const std::string& path, const std::string& identity, int64_t m
     if (!f.read(id.data(), (std::streamsize) il) || id != identity) return false;
     if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (uint64_t) max_ctx) return false;
     toks.resize(nt);
-    if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &nc, 8) || nc > 4)
+    if (!f.read((char*) toks.data(), (std::streamsize) (nt * sizeof(int32_t))) || !f.read((char*) &nc, 8) || nc > 4100)
         return false;
     cks.resize(nc);
     if (!f.read((char*) cks.data(), (std::streamsize) (nc * sizeof(int64_t))) || !f.read((char*) &m1, 8) || m1 != kMagic)

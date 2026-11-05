@@ -1141,6 +1141,9 @@ struct Model::Impl {
 #if !defined(_WIN32)
     std::unique_ptr<::strata::dsv41::expertd::Client> kxd;   // DS4_EXPERTD=host:port
     std::thread kx_place_th;                 // (its live placement)
+    std::vector<std::vector<float>> kx_dheat;   // decode-only heat by layer
+    const bool kx_nodup = std::getenv("DS4_EXPERTD_NODUP") && std::atoi(std::getenv("DS4_EXPERTD_NODUP")) != 0;
+    std::vector<uint8_t> kx_dem;   // (the placer's: demoted already)
     std::atomic<bool> lane_busy{false};      // the lane is on a request
     std::atomic<unsigned> lane_done{0};      // the requests it answered
 #endif
@@ -3303,6 +3306,8 @@ struct Model::Impl {
                 std::stable_sort(rk.begin(), rk.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
                 std::vector<::strata::dsv41::expertd::Id> cand;
                 for (const auto& x : rk) cand.push_back(x.second);
+                kx_dheat.assign(L.size(), {});
+                for (size_t li = 0; li < L.size(); ++li) kx_dheat[li] = L[li].heat;   // (seeded: the profile)
                 kxd = std::make_unique<::strata::dsv41::expertd::Client>();
                 kxd->start(kx, g.dim, g.ff, g.lim, std::move(cand), g.nl, g.n_exp);
                 if (std::getenv("DS4_EXPERTD_STATIC") == nullptr) kx_place_th = std::thread([this] { kx_place_loop(); });
@@ -5934,6 +5939,13 @@ struct Model::Impl {
             if (ck[i].pos > 0 && ck[i].pos <= pos && ck[i].win.size() == L.size()) v.push_back(i);
         return v;
     }
+    // the history marks a slot keeps too (role kChecks in the file)
+    std::vector<size_t> slot_hist() const {
+        std::vector<size_t> v;
+        for (size_t i = 0; i < hist.size(); ++i)
+            if (hist[i].pos > 0 && hist[i].pos <= pos && hist[i].win.size() == L.size()) v.push_back(i);
+        return v;
+    }
     size_t check_bytes() const {
         size_t n = 16;
         for (const Layer& l : L) n += (size_t) g.win * win_rb() + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
@@ -6043,6 +6055,597 @@ struct Model::Impl {
         return true;
     }
 
+    // a KV source's compressed rows [r0, r0 + n) as F32 on the host
+    bool kv_rows(int si, int64_t r0, int64_t n, std::vector<float>& out, std::string& err) {
+        if (si < 0 || si >= (int) srcs.size()) {
+            err = "no such source";
+            return false;
+        }
+        const Src& s = srcs[(size_t) si];
+        const int di = L[(size_t) s.layer].dev;
+        if (r0 < 0 || n <= 0 || r0 + n > src_rows(s) || s.ckv[(size_t) di] == nullptr) {
+            err = "the rows are outside the state";
+            return false;
+        }
+        Dev& d = devs[(size_t) di];
+        cudaSetDevice(d.id);
+        float* f = nullptr;
+        if (cudaMalloc(&f, (size_t) n * (size_t) g.hd * 4) != cudaSuccess) {
+            err = "no device memory";
+            return false;
+        }
+        unpack_rows(s.ckv[(size_t) di] + (size_t) r0 * ckv_rb(), kKvFp4, (int) n, g.hd, f, d.st);
+        out.resize((size_t) n * (size_t) g.hd);
+        const bool ok = cudaStreamSynchronize(d.st) == cudaSuccess &&
+                        cudaMemcpy(out.data(), f, out.size() * 4, cudaMemcpyDeviceToHost) == cudaSuccess;
+        cudaFree(f);
+        if (!ok) err = cudaGetErrorString(cudaGetLastError());
+        return ok;
+    }
+
+    // ---- KV splice: an edit in the middle, the tokens after it kept
+    // a checkpoint's rings and partial groups onto the devices (restore's
+    // copy, nothing truncated)
+    void load_rings(const Check& c) {
+        for (size_t i = 0; i < L.size(); ++i)
+            for (int m = 0; m < L[i].nm; ++m) {
+                Layer& l = member(L[i], m);
+                Dev& d = devs[(size_t) l.dev];
+                cudaSetDevice(d.id);
+                cudaMemcpyAsync(l.win, c.win[i].data(), c.win[i].size(), cudaMemcpyHostToDevice, d.st);
+                if (l.c_kv) {
+                    cudaMemcpyAsync(l.c_kv, c.comp[2 * i].data(), c.comp[2 * i].size() * 4, cudaMemcpyHostToDevice, d.st);
+                    cudaMemcpyAsync(l.c_score, c.comp[2 * i + 1].data(), c.comp[2 * i + 1].size() * 4,
+                                    cudaMemcpyHostToDevice, d.st);
+                }
+            }
+        for (Dev& d : devs) {
+            cudaSetDevice(d.id);
+            cudaStreamSynchronize(d.st);
+        }
+    }
+    // the RoPE offset of token p (the cuts before it)
+    int64_t off_at(int64_t p) const {
+        int64_t o = 0;
+        for (const auto& c : cuts)
+            if (c.first <= p) o = c.second;
+        return o;
+    }
+
+    // n packed rows (fmt, dl values) turned by delta positions in place
+    // (their RoPE part), in pieces of 16K rows
+    bool turn_rows(Dev& d, uint8_t* rows, int fmt, int64_t n, int dl, const float* freqs, int64_t delta, std::string& err) {
+        if (n <= 0 || delta == 0) return true;
+        cudaSetDevice(d.id);
+        const int64_t piece = 16384;
+        float* f = nullptr;
+        if (cudaMalloc(&f, (size_t) std::min(n, piece) * (size_t) dl * 4) != cudaSuccess) {
+            err = "no device memory to turn rows";
+            return false;
+        }
+        const size_t rb = kv_row_bytes(fmt, dl);
+        for (int64_t q = 0; q < n; q += piece) {
+            const int k = (int) std::min(piece, n - q);
+            unpack_rows(rows + (size_t) q * rb, fmt, k, dl, f, d.st);
+            Finish fz;   // (pos_step 0: every row turned by delta)
+            fz.rd = g.rd;
+            fz.pos = (int) delta;
+            fz.pos_step = 0;
+            fz.freqs = freqs;
+            fz.quant = fmt;
+            fz.pdst = rows + (size_t) q * rb;
+            fz.pdst_stride = (long long) rb;
+            finish(f, k, dl, dl, fz, d.st);
+        }
+        const bool ok = cudaStreamSynchronize(d.st) == cudaSuccess;
+        cudaFree(f);
+        if (!ok) err = std::string("turning rows: ") + cudaGetErrorString(cudaGetLastError());
+        return ok;
+    }
+
+    // Tokens [a, a + d) become rep (n of them): the followers' rows
+    // move by n - d and keep their positions (the new span goes into
+    // the gap); the new span's rows are feed_at's to compute. An odd
+    // n - d leaves the followers' paired rows one token off (whole
+    // rows moved); the seam and the end are computed again (edits)
+    bool edit_rows(int64_t a, int64_t d, const std::vector<int32_t>& rep, std::string& err) {
+        int64_t align = 1;
+        for (int r : g.ratios) align = std::lcm(align, (int64_t) std::max(1, r));
+        const int64_t n = (int64_t) rep.size(), W = g.win;
+        if (a < 0 || d < 0 || a % align != 0 || d % align != 0 || a + d + W > pos || imgs.empty() == false) {
+            err = "the span cannot be edited here";
+            return false;
+        }
+        // a span longer than the positions it goes into: the followers'
+        // positions move by `grow` (their rows and rings turned by it)
+        const int64_t room = (a + d + off_at(a + d)) - (a + off_at(a)), grow = std::max<int64_t>(0, n - room);
+        const int64_t sh = n - d;
+        for (Dev& dv : devs) {
+            cudaSetDevice(dv.id);
+            cudaDeviceSynchronize();
+        }
+        if (sh != 0) {
+            for (const Src& s : srcs) {
+                const int64_t R = std::max(1, s.ratio), from = (a + d) / R, cnt = pos / R - from, to = (a + n) / R;
+                if (cnt <= 0) continue;
+                if (to + cnt > s.cap) {
+                    err = "no room for the followers' rows";
+                    return false;
+                }
+                for (size_t di = 0; di < devs.size(); ++di) {
+                    cudaSetDevice(devs[di].id);
+                    uint8_t* bufs[2] = {s.ckv[di], s.ik[di]};
+                    const size_t rbs[2] = {ckv_rb(), ik_rb()};
+                    for (int b = 0; b < 2; ++b) {
+                        if (bufs[b] == nullptr) continue;
+                        uint8_t* tmp = nullptr;   // (overlapping ranges: through a copy)
+                        const size_t nb = (size_t) cnt * rbs[b];
+                        bool ok = cudaMalloc(&tmp, nb) == cudaSuccess &&
+                                  cudaMemcpy(tmp, bufs[b] + (size_t) from * rbs[b], nb, cudaMemcpyDeviceToDevice) == cudaSuccess &&
+                                  cudaMemcpy(bufs[b] + (size_t) to * rbs[b], tmp, nb, cudaMemcpyDeviceToDevice) == cudaSuccess;
+                        cudaFree(tmp);
+                        if (!ok) {
+                            err = std::string("moving the followers' rows: ") + cudaGetErrorString(cudaGetLastError());
+                            return false;
+                        }
+                    }
+                }
+            }
+            // the rings: slot p % W holds p, and p moves to p + sh
+            const size_t rb = win_rb(), wb = (size_t) W * rb;
+            const int64_t r = ((sh % W) + W) % W;
+            std::vector<uint8_t> was(wb), now(wb);
+            for (Layer& l0 : L)
+                for (int mi = 0; mi < l0.nm; ++mi) {
+                    Layer& l = member(l0, mi);
+                    cudaSetDevice(devs[(size_t) l.dev].id);
+                    if (cudaMemcpy(was.data(), l.win, wb, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                    for (int64_t j = 0; j < W; ++j)
+                        std::memcpy(now.data() + (size_t) ((j + r) % W) * rb, was.data() + (size_t) j * rb, rb);
+                    if (cudaMemcpy(l.win, now.data(), wb, cudaMemcpyHostToDevice) != cudaSuccess) {
+                        err = l.name + "window ring: " + cudaGetErrorString(cudaGetLastError());
+                        return false;
+                    }
+                }
+        }
+        if (grow > 0) {   // (the followers a later position: rows and rings turned)
+            for (const Src& s : srcs) {
+                const int64_t R = std::max(1, s.ratio), to = (a + n) / R, cnt = (pos + sh) / R - to;
+                for (size_t di = 0; di < devs.size(); ++di) {
+                    Dev& dv = devs[di];
+                    if (s.ckv[di] != nullptr &&
+                        !turn_rows(dv, s.ckv[di] + (size_t) to * ckv_rb(), kKvFp4, cnt, g.hd, dv.freqs_comp, grow, err))
+                        return false;
+                    if (s.ik[di] != nullptr &&
+                        !turn_rows(dv, s.ik[di] + (size_t) to * ik_rb(), kKvFp4p, cnt, g.ix_hd, dv.freqs_comp, grow, err))
+                        return false;
+                }
+            }
+            for (Layer& l0 : L)
+                for (int mi = 0; mi < l0.nm; ++mi) {
+                    Layer& l = member(l0, mi);
+                    Dev& dv = devs[(size_t) l.dev];
+                    if (!turn_rows(dv, l.win, kKvFp8, W, g.hd, l.ratio ? dv.freqs_comp : dv.freqs_win, grow, err)) return false;
+                }
+        }
+        // the cuts: the followers' offsets grow by grow - sh (their
+        // positions kept, or moved on by grow); one at a + n starts them;
+        // those inside the span go
+        const int64_t fol = off_at(a + d) - sh + grow;
+        std::vector<std::pair<int64_t, int64_t>> nc;
+        for (const auto& c : cuts)
+            if (c.first <= a) nc.push_back(c);
+        if (fol != off_at(a)) nc.push_back({a + n, fol});
+        for (const auto& c : cuts)
+            if (c.first > a + d) nc.push_back({c.first + sh, c.second - sh + grow});
+        cuts.swap(nc);
+        rope_off = cuts.empty() ? 0 : cuts.back().second;
+        toks.erase(toks.begin() + a, toks.begin() + a + d);
+        ctoks.erase(ctoks.begin() + a, ctoks.begin() + a + d);
+        toks.insert(toks.begin() + a, rep.begin(), rep.end());
+        for (int64_t i = 0; i < n; ++i) ctoks.insert(ctoks.begin() + a + i, ctok(a + i, rep[(size_t) i]));
+        pos += sh;
+        // checkpoints past the span move with the followers (their rings
+        // turned the same way); those inside it go
+        const auto move = [&](Check& c0) {
+            if (c0.pos <= a) return true;
+            // (odd: its partial group is off; grown: its rings unturned)
+            if (c0.pos <= a + d || sh % align != 0 || grow > 0) return false;
+            c0.pos += sh;
+            if (sh != 0) {
+                const size_t rb = win_rb();
+                const int64_t r = ((sh % W) + W) % W;
+                for (auto& w : c0.win) {
+                    if (w.size() != (size_t) W * rb) continue;
+                    std::vector<uint8_t> o(w.size());
+                    for (int64_t j = 0; j < W; ++j)
+                        std::memcpy(o.data() + (size_t) ((j + r) % W) * rb, w.data() + (size_t) j * rb, rb);
+                    w.swap(o);
+                }
+            }
+            return true;
+        };
+        for (Check& c0 : ck)
+            if (!move(c0)) c0.pos = -1;
+        hist.erase(std::remove_if(hist.begin(), hist.end(), [&](Check& h) { return !move(h); }), hist.end());
+        slot_held = false;
+        return true;
+    }
+
+    // several edits at once: (a, d, rep) in today's positions, sorted, not
+    // overlapping. Rows right to left (earlier positions stay put), then
+    // the seams left to right, merged where they meet
+    bool edits(std::vector<std::pair<std::pair<int64_t, int64_t>, std::vector<int32_t>>> es, int64_t seam, std::string& err) {
+        std::sort(es.begin(), es.end(), [](const auto& x, const auto& y) { return x.first.first < y.first.first; });
+        for (size_t i = es.size(); i-- > 0;)
+            if (!edit_rows(es[i].first.first, es[i].first.second, es[i].second, err)) return false;
+        // the new positions: each edit's start moves by the shifts before it
+        std::vector<std::pair<int64_t, int64_t>> rg;   // (recompute from, to)
+        int64_t shift = 0;
+        // each seam twice its edit's size, within [DS4_SPLICE_SEAM_MIN
+        // (128), seam]
+        static const int64_t smin = std::getenv("DS4_SPLICE_SEAM_MIN") ? std::atoll(std::getenv("DS4_SPLICE_SEAM_MIN")) : 128;
+        for (const auto& e : es) {
+            const int64_t a = e.first.first + shift, n = (int64_t) e.second.size(), d = e.first.second;
+            const int64_t sm = std::min<int64_t>(std::max<int64_t>(0, seam), std::max<int64_t>(smin, 2 * std::max(n, d)));
+            rg.push_back({a, std::min<int64_t>(pos, a + n + sm)});
+            shift += n - d;
+        }
+        // an odd total change: the end's partial group and last rows
+        // are paired anew (the last 256 tokens computed again, kept)
+        int64_t align = 1;
+        for (int r : g.ratios) align = std::lcm(align, (int64_t) std::max(1, r));
+        const bool odd = shift % align != 0;
+        static const bool batch = !std::getenv("DS4_SPLICE_BATCH") || std::atoi(std::getenv("DS4_SPLICE_BATCH")) != 0;
+        if (odd) rg.push_back({std::max<int64_t>(0, (pos - 256) / align * align), pos});
+        if (batch && chunk > 0) return batch_seams(rg, err);
+        if (odd) rg.pop_back();
+        for (size_t i = 0; i < rg.size();) {
+            int64_t s = rg[i].first, t = rg[i].second;
+            size_t j = i + 1;
+            while (j < rg.size() && rg[j].first <= t) t = std::max(t, rg[j++].second);
+            if (t > s && !feed_at(s, t, err)) return false;
+            i = j;
+        }
+        if (odd) {
+            const int64_t s = std::max<int64_t>(0, (pos - 256) / align * align);
+            if (s < pos && !feed_at(s, pos, err, true)) return false;
+        }
+        return true;
+    }
+
+    // every seam [limit, e) in one run of chunks (each layer's experts
+    // read once for all): each from a warm-up of DS4_SPLICE_WARM tokens
+    // before it (fresh rings; their own rows put back after)
+    bool batch_seams(std::vector<std::pair<int64_t, int64_t>> rg, std::string& err) {
+        static const int64_t warm = std::getenv("DS4_SPLICE_WARM") ? std::atoll(std::getenv("DS4_SPLICE_WARM")) : 256;
+        int64_t align = 1;
+        for (int r : g.ratios) align = std::lcm(align, (int64_t) std::max(1, r));
+        std::sort(rg.begin(), rg.end());
+        struct Sg {
+            int64_t m, lim, e;
+        };
+        std::vector<Sg> sg;   // (merged where a warm-up meets the one before)
+        for (const auto& r : rg) {
+            const int64_t lim = r.first, e = std::min(r.second, pos);
+            if (e <= lim) continue;
+            const int64_t m = std::max<int64_t>(0, (lim - warm) / align * align);
+            if (!sg.empty() && m <= sg.back().e) {
+                sg.back().e = std::max(sg.back().e, e);
+                continue;
+            }
+            sg.push_back({m, lim, e});
+        }
+        if (sg.empty()) return true;
+        Check live;
+        fill(live);
+        // the warm-ups' rows (exact as they are), every source and device
+        std::vector<std::vector<uint8_t>> keep;
+        const auto rows_io = [&](bool save) {
+            size_t q = 0;
+            for (const Sg& s0 : sg)
+                for (const Src& s : srcs) {
+                    const int64_t R = std::max(1, s.ratio), r0 = s0.m / R, nr = s0.lim / R - r0;
+                    for (size_t di = 0; di < devs.size(); ++di) {
+                        uint8_t* bufs[2] = {s.ckv[di], s.ik[di]};
+                        const size_t rbs[2] = {ckv_rb(), ik_rb()};
+                        for (int k = 0; k < 2; ++k) {
+                            if (bufs[k] == nullptr || nr <= 0) continue;
+                            cudaSetDevice(devs[di].id);
+                            if (save) keep.emplace_back((size_t) nr * rbs[k]);
+                            std::vector<uint8_t>& h = keep[q++];
+                            uint8_t* dp = bufs[k] + (size_t) r0 * rbs[k];
+                            if (save) cudaMemcpy(h.data(), dp, h.size(), cudaMemcpyDeviceToHost);
+                            else cudaMemcpy(dp, h.data(), h.size(), cudaMemcpyHostToDevice);
+                        }
+                    }
+                }
+        };
+        rows_io(true);
+        // the pieces: one RoPE offset each (split at cuts), chunk-sized
+        Run run;
+        std::vector<int64_t> ro;
+        std::vector<char> fresh;
+        int64_t total = 0;
+        for (const Sg& s0 : sg) {
+            std::vector<int64_t> b{s0.m};
+            for (const auto& c : cuts)
+                if (c.first > s0.m && c.first < s0.e) b.push_back(c.first);
+            b.push_back(s0.e);
+            bool first = true;
+            for (size_t i = 0; i + 1 < b.size(); ++i)
+                for (int64_t q = b[i]; q < b[i + 1]; q += chunk) {
+                    const int T = (int) std::min<int64_t>(chunk, b[i + 1] - q);
+                    run.p0.push_back(q);
+                    run.T.push_back(T);
+                    run.seq.push_back(++win_seq);
+                    ro.push_back(off_at(q));
+                    fresh.push_back(first ? 1 : 0);
+                    first = false;
+                    total += T;
+                }
+        }
+        seg_run = &run;
+        seg_ro = &ro;
+        seg_fresh = &fresh;
+        const bool ok = forward_chunks(nullptr, (int) total, 1, err);
+        seg_run = nullptr;
+        seg_ro = nullptr;
+        seg_fresh = nullptr;
+        for (Dev& dv : devs) {
+            cudaSetDevice(dv.id);
+            cudaDeviceSynchronize();
+        }
+        rows_io(false);
+        if (!(ok && sg.back().e == pos)) load_rings(live);   // (an end reached: its rings are the new ones)
+        std::fprintf(stderr, "ds4 splice: %zu seams in one run, %lld tokens, %zu chunks\n", sg.size(), (long long) total,
+                     run.T.size());
+        slot_held = false;
+        return ok;
+    }
+
+    // Recompute tokens [limit, e) in place; the rows after e and the live
+    // rings stay. The rings at limit: the latest checkpoint within
+    // DS4_SPLICE_NEAR (512) before it, else a warm-up (below)
+    // keep_end (e at the end of the state): the rings and partial groups
+    // it leaves are the live ones
+    bool feed_at(int64_t limit, int64_t e, std::string& err, bool keep_end = false) {
+        static const int64_t near = std::getenv("DS4_SPLICE_NEAR") ? std::atoll(std::getenv("DS4_SPLICE_NEAR")) : 512;
+        static const int64_t warm = std::getenv("DS4_SPLICE_WARM") ? std::atoll(std::getenv("DS4_SPLICE_WARM")) : 256;
+        int64_t align = 1;
+        for (int r : g.ratios) align = std::lcm(align, (int64_t) std::max(1, r));
+        if (e <= limit || e > pos || limit < 0) {
+            err = "the seam is outside the state";
+            return false;
+        }
+        const Check* b = best_check(limit);
+        // warm-up: the `warm` tokens before limit read from empty rings,
+        // only for the rings they leave; their own (exact) rows put back
+        const bool exact = b != nullptr && limit - b->pos <= std::max(near, warm);
+        const int64_t m = exact ? b->pos : std::max<int64_t>(b != nullptr ? b->pos : 0, (limit - warm) / align * align);
+        Check zero;
+        if (!exact && (b == nullptr || b->pos != m)) {
+            zero.pos = m;
+            zero.win.resize(L.size());
+            zero.comp.resize(L.size() * 2);
+            for (size_t i = 0; i < L.size(); ++i) {
+                zero.win[i].assign((size_t) g.win * win_rb(), 0);
+                if (L[i].c_kv) {
+                    zero.comp[2 * i].assign((size_t) L[i].ratio * g.hd, 0.0f);
+                    zero.comp[2 * i + 1].assign((size_t) L[i].ratio * g.hd, 0.0f);
+                }
+            }
+            b = &zero;
+        }
+        Check live;
+        fill(live);
+        const int64_t pos0 = pos, ro0 = rope_off;
+        const std::vector<int32_t> tk0 = toks, ct0 = ctoks;
+        // (the warm-up's rows, to put back: every source, every device)
+        std::vector<std::vector<uint8_t>> keep;
+        const auto rows_io = [&](bool save) {
+            size_t q = 0;
+            for (const Src& s : srcs) {
+                const int64_t R = std::max(1, s.ratio), r0 = m / R, nr = limit / R - r0;
+                for (size_t di = 0; di < devs.size(); ++di) {
+                    uint8_t* bufs[2] = {s.ckv[di], s.ik[di]};
+                    const size_t rbs[2] = {ckv_rb(), ik_rb()};
+                    for (int k = 0; k < 2; ++k) {
+                        if (bufs[k] == nullptr || nr <= 0) continue;
+                        cudaSetDevice(devs[di].id);
+                        if (save) keep.emplace_back((size_t) nr * rbs[k]);
+                        std::vector<uint8_t>& h = keep[q++];
+                        uint8_t* dp = bufs[k] + (size_t) r0 * rbs[k];
+                        if (save) cudaMemcpy(h.data(), dp, h.size(), cudaMemcpyDeviceToHost);
+                        else cudaMemcpy(dp, h.data(), h.size(), cudaMemcpyHostToDevice);
+                    }
+                }
+            }
+        };
+        if (!exact && m < limit) rows_io(true);
+        load_rings(*b);
+        // [s, t) read with its RoPE offsets (one run a stretch between cuts)
+        const auto run_span = [&](int64_t s0, int64_t t0) {
+            std::vector<int64_t> bounds{s0};
+            for (const auto& c : cuts)
+                if (c.first > s0 && c.first < t0) bounds.push_back(c.first);
+            bounds.push_back(t0);
+            for (size_t i = 0; i + 1 < bounds.size(); ++i) {
+                const int64_t s = bounds[i], t = bounds[i + 1];
+                pos = s;
+                toks.resize((size_t) s);
+                ctoks.resize((size_t) s);
+                rope_off = off_at(s);
+                const std::vector<int> run(tk0.begin() + s, tk0.begin() + t);
+                const int nr = (int) run.size();
+                const bool ok = chunk > 0 && nr >= chunk_min ? forward_chunks(run.data(), nr, 1, err)
+                                                             : feed_windows(run.data(), nr, 1, err);
+                if (!ok) return false;
+            }
+            return true;
+        };
+        bool ok = true;
+        if (exact) {
+            ok = run_span(m, e);
+        } else {
+            ok = m >= limit || run_span(m, limit);
+            if (ok && m < limit) {
+                for (Dev& dv : devs) {
+                    cudaSetDevice(dv.id);
+                    cudaDeviceSynchronize();
+                }
+                rows_io(false);
+            }
+            ok = ok && run_span(limit, e);
+        }
+        std::vector<int32_t> ct1 = ctoks;   // (the recomputed span's, then the followers')
+        if (ct1.size() == (size_t) e) ct1.insert(ct1.end(), ct0.begin() + e, ct0.end());
+        else ct1 = ct0;
+        if (!(keep_end && ok && e == pos0)) load_rings(live);
+        pos = pos0;
+        toks = tk0;
+        ctoks.swap(ct1);
+        rope_off = ro0;
+        slot_held = false;
+        return ok;
+    }
+
+    // Append tokens [s0, s0 + n) of a saved conversation (a slot's
+    // bytes) at pos: each KV source's rows, their RoPE part turned by
+    // the change of position; the rings are left (a seam reads them)
+    bool splice_in(const uint8_t* data, size_t bytes, int64_t s0, int64_t n, std::string& err) {
+        int64_t align = 1;
+        for (int r : g.ratios) align = std::lcm(align, (int64_t) std::max(1, r));
+        if (s0 < 0 || n <= 0 || s0 % align != 0 || n % align != 0 || pos % align != 0 || imgs.empty() == false ||
+            pos + n > o.max_context) {
+            err = "the span cannot be spliced in here";
+            return false;
+        }
+        size_t off = 0;
+        const auto room = [&](size_t k) { return off + k <= bytes; };
+        const auto u64 = [&](uint64_t& v) {
+            if (!room(8)) return false;
+            std::memcpy(&v, data + off, 8);
+            off += 8;
+            return true;
+        };
+        const auto bad = [&](const char* what) {
+            err = std::string("the slot ") + what;
+            return false;
+        };
+        uint64_t mg = 0, il = 0, np = 0;
+        if (!u64(mg) || mg != kSlotMagic || !u64(il) || !room(il)) return bad("is not one");
+        if (std::string((const char*) data + off, il) != slot_identity()) return bad("is another model's");
+        off += il;
+        if (!u64(np) || s0 + n > (int64_t) np || !room(np * 4)) return bad("is shorter than the span");
+        const int32_t* stoks = (const int32_t*) (data + off);
+        off += np * 4;
+        for (size_t i = 0; i < L.size(); ++i) {   // (the rings and partial groups: not taken)
+            uint64_t wb = 0, cn = 0;
+            if (!u64(wb) || !room(wb)) return bad("is cut short");
+            off += wb;
+            if (!u64(cn) || !room(cn * 8)) return bad("is cut short");
+            off += cn * 8;
+        }
+        std::vector<const uint8_t*> sck(srcs.size(), nullptr), sik(srcs.size(), nullptr);
+        std::vector<uint64_t> srows(srcs.size(), 0);
+        for (size_t k = 0; k < srcs.size(); ++k) {
+            if (!u64(srows[k])) return bad("is cut short");
+            const size_t cb = srows[k] * ckv_rb(), ib = srows[k] * ik_rb();
+            if (!room(cb + ib)) return bad("is cut short");
+            sck[k] = data + off;
+            sik[k] = data + off + cb;
+            off += cb + ib;
+        }
+        uint64_t nc = 0;
+        if (!u64(nc) || !room(nc * check_bytes())) return bad("is cut short");
+        off += nc * check_bytes();
+        // the slot's RoPE gaps: the offset its span was rotated with
+        int64_t soff = 0;
+        if (room(16)) {
+            uint64_t m2 = 0, nk = 0;
+            std::memcpy(&m2, data + off, 8);
+            if (m2 == kCutsMagic) {
+                off += 8;
+                if (!u64(nk) || !room(nk * 16)) return bad("is cut short");
+                for (uint64_t k = 0; k < nk; ++k) {
+                    int64_t a = 0, b = 0;
+                    std::memcpy(&a, data + off + 16 * k, 8);
+                    std::memcpy(&b, data + off + 16 * k + 8, 8);
+                    if (a <= s0) soff = b;
+                    else if (a < s0 + n) return bad("span holds a cut");
+                }
+            }
+        }
+        const int64_t delta = (pos + rope_off) - (s0 + soff);
+        for (Dev& dv : devs) {
+            cudaSetDevice(dv.id);
+            cudaDeviceSynchronize();
+        }
+        for (size_t k = 0; k < srcs.size(); ++k) {
+            Src& s = srcs[k];
+            const int64_t R = std::max(1, s.ratio), r0 = s0 / R, nr = n / R, t0 = pos / R;
+            if (nr == 0) continue;
+            if (r0 + nr > (int64_t) srows[k]) return bad("has fewer rows than the span");
+            if (t0 + nr > s.cap) {
+                err = "no room for the span's rows";
+                return false;
+            }
+            for (size_t di = 0; di < devs.size(); ++di) {
+                if (s.ckv[di] == nullptr) continue;
+                Dev& d = devs[di];
+                cudaSetDevice(d.id);
+                const size_t rbm = std::max(ckv_rb(), ik_rb());
+                const int dm = std::max(g.hd, g.ix_hd);
+                uint8_t* stg = nullptr;
+                float* f32 = nullptr;
+                if (cudaMalloc(&stg, (size_t) nr * rbm) != cudaSuccess ||
+                    cudaMalloc(&f32, (size_t) nr * (size_t) dm * 4) != cudaSuccess) {
+                    err = "no device memory for the span";
+                    return false;
+                }
+                bool ok = true;
+                for (int b = 0; b < 2 && ok; ++b) {
+                    uint8_t* dst = b ? s.ik[di] : s.ckv[di];
+                    if (dst == nullptr) continue;
+                    const int fmt = b ? kKvFp4p : kKvFp4, dl = b ? g.ix_hd : g.hd;
+                    const size_t rb = b ? ik_rb() : ckv_rb();
+                    ok = cudaMemcpy(stg, (b ? sik[k] : sck[k]) + (size_t) r0 * rb, (size_t) nr * rb,
+                                    cudaMemcpyHostToDevice) == cudaSuccess;
+                    if (!ok) break;
+                    unpack_rows(stg, fmt, (int) nr, dl, f32, d.st);
+                    Finish f;   // (pos_step 0: every row turned by delta)
+                    f.rd = g.rd;
+                    f.pos = (int) delta;
+                    f.pos_step = 0;
+                    f.freqs = d.freqs_comp;
+                    f.quant = fmt;
+                    f.pdst = dst + (size_t) t0 * rb;
+                    f.pdst_stride = (long long) rb;
+                    finish(f32, (int) nr, dl, dl, f, d.st);
+                    ok = cudaStreamSynchronize(d.st) == cudaSuccess;
+                }
+                cudaFree(stg);
+                cudaFree(f32);
+                if (!ok) {
+                    err = std::string("splicing rows in: ") + cudaGetErrorString(cudaGetLastError());
+                    return false;
+                }
+            }
+        }
+        for (int64_t i = 0; i < n; ++i) {
+            const int32_t t = stoks[s0 + i];
+            toks.push_back(t);
+            ctoks.push_back(t < pk.eg_vocab ? pk.eg_map[(size_t) t] : 0);
+        }
+        pos += n;
+        slot_held = false;
+        return true;
+    }
+
     // ---- the kept conversations (a slot): the state out of the model and back, through a file or a host buffer.
     // A prompt that continues the state is reused in place (checkpoint / restore, the compressed KV left where it is);
     // a conversation that leaves the model for another one is a slot - the whole state: the position, its tokens,
@@ -6060,7 +6663,7 @@ struct Model::Impl {
         size_t n = 8 + 8 + slot_identity().size() + 8 + (size_t) pos * 4;
         for (const Layer& l : L) n += 8 + (size_t) g.win * win_rb() + 8 + (l.c_kv ? 2 * (size_t) l.ratio * g.hd * 4 : 0);
         for (const Src& s : srcs) n += 8 + (size_t) src_rows(s) * (ckv_rb() + ik_rb());
-        n += 8 + slot_checks().size() * check_bytes();   // (the checkpoints: what the slot can be taken back at)
+        n += 8 + (slot_checks().size() + slot_hist().size()) * check_bytes();   // (what it can be taken back at)
         if (cuts.empty() == false) n += 16 + cuts.size() * 16;   // (splice_out's gaps, only when there are some)
         return n + 8;
     }
@@ -6146,11 +6749,13 @@ struct Model::Impl {
         }
         {
             const std::vector<int> cs = slot_checks();
-            const uint64_t nc = cs.size();
+            const std::vector<size_t> hs = slot_hist();
+            const uint64_t nc = cs.size() + hs.size();
             put(&nc, 8);
-            for (int k : cs) {
-                const Check& c = ck[k];
-                const uint64_t role = (uint64_t) k, cp = (uint64_t) c.pos;
+            for (size_t q = 0; q < nc; ++q) {
+                const bool h = q >= cs.size();
+                const Check& c = h ? hist[hs[q - cs.size()]] : ck[cs[q]];
+                const uint64_t role = h ? (uint64_t) kChecks : (uint64_t) cs[q], cp = (uint64_t) c.pos;
                 put(&role, 8);
                 put(&cp, 8);
                 for (size_t i = 0; i < L.size(); ++i) {
@@ -6315,6 +6920,7 @@ struct Model::Impl {
             off += cb + ib;
         }
         Check got[kChecks];   // the slot's checkpoints: the positions it can be taken back at
+        std::vector<Check> got_hist;
         {
             uint64_t nc = 0;
             if (!room(8)) {
@@ -6323,7 +6929,7 @@ struct Model::Impl {
             }
             std::memcpy(&nc, data + off, 8);
             off += 8;
-            if (nc > (uint64_t) kChecks) {
+            if (nc > (uint64_t) kChecks + 4096) {
                 err = "the slot's checkpoints are damaged";
                 return false;
             }
@@ -6336,11 +6942,13 @@ struct Model::Impl {
                 std::memcpy(&role, data + off, 8);
                 std::memcpy(&cp, data + off + 8, 8);
                 off += 16;
-                if (role >= (uint64_t) kChecks || got[role].pos >= 0 || cp == 0 || cp > (uint64_t) n_pos) {
+                const bool is_h = role == (uint64_t) kChecks;
+                if (role > (uint64_t) kChecks || (!is_h && got[role].pos >= 0) || cp == 0 || cp > (uint64_t) n_pos) {
                     err = "the slot's checkpoints are damaged";
                     return false;
                 }
-                Check& c = got[role];
+                if (is_h) got_hist.emplace_back();
+                Check& c = is_h ? got_hist.back() : got[role];
                 c.pos = (int64_t) cp;
                 c.win.resize(L.size());
                 c.comp.resize(L.size() * 2);
@@ -6405,7 +7013,8 @@ struct Model::Impl {
             ctoks[i] = toks[i] < pk.eg_vocab ? pk.eg_map[(size_t) toks[i]] : 0;
         for (int k = 0; k < kChecks; ++k) ck[k] = std::move(got[k]);   // (the slot's own; the old ones held the state
                                                                // this one replaced)
-        hist.clear();
+        hist.swap(got_hist);
+        std::sort(hist.begin(), hist.end(), [](const Check& a, const Check& b) { return a.pos < b.pos; });
         slot_held = false;
         ok = true;
         return true;
@@ -7781,6 +8390,11 @@ struct Model::Impl {
             std::atomic_thread_fence(std::memory_order_acquire);
 #if !defined(_WIN32)
             lane_busy.store(true, std::memory_order_seq_cst);   // (before any holds(): the placer's wait)
+            // decode heat: a token's first layer ages it (half-life
+            // ~350 decode tokens; prompt reading never counts)
+            if (kxd && r.T == 1 && layer_of[next % kRing].load(std::memory_order_relaxed) == 0)
+                for (auto& v : kx_dheat)
+                    for (float& h : v) h *= 0.998f;
 #endif
             const int li = layer_of[next % kRing].load(std::memory_order_acquire);
             Resp& rp = resps[next % kRing];
@@ -7837,6 +8451,9 @@ struct Model::Impl {
                         if (e < 0 || e >= l.n_exp) continue;
                         ++pr[e];
                         l.heat[(size_t) e] += 1.0f;
+#if !defined(_WIN32)
+                        if (T == 1 && li < (int) kx_dheat.size()) kx_dheat[(size_t) li][(size_t) e] += 1.0f;
+#endif
                         if (fl != nullptr) {
                             ++st.ahead_picks;
                             st.ahead_hit_k += fl[e] & 1;
@@ -8038,39 +8655,81 @@ struct Model::Impl {
                 continue;
             }
             if (!kxd) continue;
-            std::vector<H> hot, cold;
+            // DS4_EXPERTD_NODUP=1: what the daemon holds goes first when
+            // the RAM store needs a slot (its room to the tail instead)
+            if (kx_nodup && store) {
+                kx_dem.resize((size_t) g.nl * (size_t) g.n_exp, 0);
+                size_t nd = 0;
+                for (const Layer& l : L) {
+                    if (l.mtp || l.il < 0 || l.il >= g.nl || l.n_exp != g.n_exp) continue;
+                    for (int e = 0; e < l.n_exp; ++e) {
+                        uint8_t& m = kx_dem[(size_t) l.il * (size_t) g.n_exp + (size_t) e];
+                        const bool h = kxd->holds(l.il, e);
+                        if (h && !m) {
+                            store->demote(l.il, e);
+                            m = 1;
+                            ++nd;
+                        } else if (!h) {
+                            m = 0;
+                        }
+                    }
+                }
+                if (nd >= 64) std::fprintf(stderr, "ds4 expertd: %zu daemon-held experts set first to go in the RAM store\n", nd);
+            }
+            // by layer kind (its three types): a daemon slot only
+            // takes an expert of the same size
+            std::map<int, std::pair<std::vector<H>, std::vector<H>>> by;
             for (const Layer& l : L) {
                 if (l.mtp || l.il < 0 || l.il >= g.nl || l.n_exp != g.n_exp || l.heat.size() != (size_t) l.n_exp) continue;
                 // (the daemon takes the i-quant layers iq::mv takes)
                 bool fits = true;
+                int kind = 0;
                 for (int r = 0; r < 3; ++r) {
                     const int ty = gg::expert_type(l.lay, r);
                     fits = fits && gg::iq::supported(ty) && !gg::iq::is_tq(ty);
+                    kind = kind * 64 + ty;
                 }
+                std::vector<H>& hot = by[kind].first;
+                std::vector<H>& cold = by[kind].second;
                 // an expert's worth there: its heat times the time a pick
                 // saves in its layer (the lane's minus the daemon's)
                 const float gain = (float) kx_gain(l.il);
+                const size_t li = (size_t) (&l - L.data());
+                const std::vector<float>& dh = li < kx_dheat.size() && kx_dheat[li].size() == (size_t) l.n_exp ? kx_dheat[li] : l.heat;
                 for (int e = 0; e < l.n_exp; ++e) {
                     const bool vram = !l.slot.empty() && l.slot[(size_t) e] >= 0;
                     const bool kx = kxd->holds(l.il, e);
-                    const float v = l.heat[(size_t) e] * gain;
+                    const float v = dh[(size_t) e] * gain;
                     if (kx) cold.push_back({vram ? -1.0f : v, l.il, e});
                     else if (!vram && fits && gain > 0.0f) hot.push_back({v, l.il, e});
                 }
             }
-            std::sort(hot.begin(), hot.end(), [](const H& a, const H& b) { return a.h > b.h; });
-            std::sort(cold.begin(), cold.end(), [](const H& a, const H& b) { return a.h < b.h; });
-            const size_t n = std::min(hot.size(), cold.size());
-            for (size_t i = 0; i < n && (int) i < max_round && !quit.load(std::memory_order_relaxed); ++i) {
-                if (hot[i].h <= 1.25f * cold[i].h + 2.0f * kx_gain_ref) break;
-                kxd->unhold(cold[i].il, cold[i].e);
+            // each kind's worthwhile pairs, then the best of all first
+            std::vector<std::pair<H, H>> sw;
+            for (auto& kv : by) {
+                auto& hot = kv.second.first;
+                auto& cold = kv.second.second;
+                std::sort(hot.begin(), hot.end(), [](const H& a, const H& b) { return a.h > b.h; });
+                std::sort(cold.begin(), cold.end(), [](const H& a, const H& b) { return a.h < b.h; });
+                for (size_t i = 0; i < std::min(hot.size(), cold.size()); ++i) {
+                    if (hot[i].h <= 1.25f * cold[i].h + 2.0f * kx_gain_ref) break;
+                    sw.push_back({hot[i], cold[i]});
+                }
+            }
+            std::sort(sw.begin(), sw.end(), [](const std::pair<H, H>& a, const std::pair<H, H>& b) {
+                return a.first.h - a.second.h > b.first.h - b.second.h;
+            });
+            for (size_t i = 0; i < sw.size() && (int) i < max_round && !quit.load(std::memory_order_relaxed); ++i) {
+                const H& hi = sw[i].first;
+                const H& co = sw[i].second;
+                kxd->unhold(co.il, co.e);
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 // (a request that may still hold it: answered first)
                 const unsigned d0 = lane_done.load(std::memory_order_seq_cst);
                 while (lane_busy.load(std::memory_order_seq_cst) && lane_done.load(std::memory_order_seq_cst) == d0 &&
                        !quit.load(std::memory_order_relaxed))
                     std::this_thread::sleep_for(std::chrono::microseconds(50));
-                if (kxd->swap(Id{(uint16_t) cold[i].il, (uint16_t) cold[i].e}, Id{(uint16_t) hot[i].il, (uint16_t) hot[i].e}))
+                if (kxd->swap(Id{(uint16_t) co.il, (uint16_t) co.e}, Id{(uint16_t) hi.il, (uint16_t) hi.e}))
                     ++st.kx_swaps;
                 else
                     ++st.kx_swap_fails;
@@ -8595,6 +9254,16 @@ struct Model::Impl {
         Chunk& c = *chunks[(size_t) l.dev];
         cudaSetDevice(d.id);
         cudaStream_t s = d.st;
+        // a splice's run (seg_ro): each chunk its own RoPE offset; a
+        // seg_fresh one starts from an empty ring and partial groups
+        const int64_t rope_off = seg_ro != nullptr ? (*seg_ro)[(size_t) wp.k] : this->rope_off;
+        if (seg_fresh != nullptr && (*seg_fresh)[(size_t) wp.k] && !kv_only) {
+            CK(cudaMemsetAsync(l.win, 0, (size_t) g.win * win_rb(), s));
+            if (l.c_kv) {
+                CK(cudaMemsetAsync(l.c_kv, 0, (size_t) l.ratio * g.hd * 4, s));
+                CK(cudaMemsetAsync(l.c_score, 0, (size_t) l.ratio * g.hd * 4, s));
+            }
+        }
         prof_mark(d, 0);
         const int nm = L0.nm;
         const int D = g.dim, H = g.hc, HD = g.hd, NHL = l.ahn, HQ = NHL * HD, OG = l.ogn, FF = l.ffn;
@@ -9044,6 +9713,11 @@ struct Model::Impl {
     // groups pipelined (a group takes chunk k + 1 while the next takes chunk k: the hand-offs and the sources' rows
     // two deep, each slot reused once its readers acknowledged it), the streamed experts' copies running ahead across
     // layers and chunks
+    // a splice's pieces as one run (forward_chunks with seg_run set)
+    const std::vector<int64_t>* seg_ro = nullptr;
+    const std::vector<char>* seg_fresh = nullptr;
+    struct Run;
+    const Run* seg_run = nullptr;
     struct Run {
         std::vector<int64_t> p0;
         std::vector<int> T;
@@ -9807,11 +10481,13 @@ struct Model::Impl {
         if (n < 1) return true;
         flow_used.store(true);
         std::lock_guard<std::mutex> warm_lk(warm_mu);   // (the warm-up, if it is running, finishes first)
-        if (pos + n > o.max_context) {
+        // (seg_run: a splice's pieces in the state, its tokens in toks)
+        const bool segr = seg_run != nullptr;
+        if (!segr && pos + n > o.max_context) {
             err = "the context is full";
             return false;
         }
-        for (int t = 0; t < n; ++t)
+        for (int t = 0; t < n && !segr; ++t)
             if (tk[t] < 0 || tk[t] >= g.vocab) {
                 err = "token " + std::to_string(tk[t]) + " out of range";
                 return false;
@@ -9824,7 +10500,7 @@ struct Model::Impl {
         // kv_only, the cut's chunk through those over all its rows and through the rest from the cut on (Run::r0, a
         // view of its buffers), the chunks after it through every layer - each layer's experts read as without the
         // skip.  One GPU (DS4_YOCO=1; 0: off); not with every row's logits (tests)
-        const int yl = logits_rows > kWin ? -1 : yoco_layer();
+        const int yl = segr || logits_rows > kWin ? -1 : yoco_layer();
         // (DS4_YOCO_KEEP=<rows>: fewer - DeepSeek's own serving replays the last 128 tokens through those layers
         //  (DeepInfer's "SWA bounded replay"), which shifts the answers a little; at least one window)
         static const int keep_env = std::getenv("DS4_YOCO_KEEP") ? std::atoi(std::getenv("DS4_YOCO_KEEP")) : 0;
@@ -9835,7 +10511,8 @@ struct Model::Impl {
         const int nc = (n + chunk - 1) / chunk, per = (n + nc - 1) / nc;
         if (ds4_dbg("DS4_DBG_CHUNK")) std::fprintf(stderr, "forward_chunks n %d nc %d per %d\n", n, nc, per);
         Run run;
-        for (int x = 0; x < n; x += per) {
+        if (segr) run = *seg_run;
+        for (int x = 0; x < n && !segr; x += per) {
             run.p0.push_back(pos + x);
             run.T.push_back(std::min(per, n - x));
             run.seq.push_back(++win_seq);
@@ -9847,7 +10524,7 @@ struct Model::Impl {
         }
         logits_all = logits_rows > kWin;
         if (logits_all) chunk_logits.resize((size_t) n * g.vocab);
-        for (int t = 0; t < n; ++t) {
+        for (int t = 0; t < n && !segr; ++t) {
             toks.push_back(tk[t]);
             ctoks.push_back(ctok(pos + t, tk[t]));
         }
@@ -10037,7 +10714,7 @@ struct Model::Impl {
             if (!tp) pm_learn(n, picked);
         }
         if (logits_all) n_logits = (T_last - 1) % kWin + 1;   // (sample() takes the last row of d.logits)
-        pos += n;
+        if (!segr) pos += n;
         st.tokens += n;
         cache_tick(n);
         if (lm_end_.on) {   // (the layer cache's RAM back before the store and the swaps want it)
@@ -10046,7 +10723,7 @@ struct Model::Impl {
         }
         cache_settle();
         const int nr = std::min(T_last, tap_cap);
-        if (!seed_drafter(pos - nr, nr, 0, err)) return false;
+        if (!segr && !seed_drafter(pos - nr, nr, 0, err)) return false;
         if (snap_slot >= 0) {   // checkpoint `snap_slot` from what the layers kept (the drafter's blocks: as they are -
             // the next feed seeds them again from its own rows, past this position)
             Check& ckp = ck[snap_slot & 1];
@@ -11241,6 +11918,31 @@ bool Model::feed(const int* tokens, int n, int logits_rows, std::string& err) {
     }
     return p.feed_windows(tokens, n, logits_rows, err);
 }
+int64_t Model::edit_room(int64_t a, int64_t d) const { return (a + d + p_->off_at(a + d)) - (a + p_->off_at(a)); }
+int Model::kv_sources() const { return (int) p_->srcs.size(); }
+int Model::kv_ratio(int s) const { return s >= 0 && s < (int) p_->srcs.size() ? std::max(1, p_->srcs[(size_t) s].ratio) : 0; }
+int Model::kv_layer(int s) const { return s >= 0 && s < (int) p_->srcs.size() ? p_->srcs[(size_t) s].layer : -1; }
+bool Model::kv_rows(int s, int64_t r0, int64_t n, std::vector<float>& out, std::string& err) {
+    return p_->kv_rows(s, r0, n, out, err);
+}
+bool Model::splice_edit(int64_t a, int64_t d, const std::vector<int32_t>& rep, int64_t seam, std::string& err) {
+    Impl& p = *p_;
+    PromptFeed pf(p.prompt_feed);
+    p.pm.last = -1;
+    p.halted = false;
+    if (!p.edit_rows(a, d, rep, err)) return false;
+    const int64_t e = std::min<int64_t>(p.pos, a + (int64_t) rep.size() + std::max<int64_t>(0, seam));
+    return e <= a || p.feed_at(a, e, err);
+}
+bool Model::splice_edits(const std::vector<Edit>& es, int64_t seam, std::string& err) {
+    Impl& p = *p_;
+    PromptFeed pf(p.prompt_feed);
+    p.pm.last = -1;
+    p.halted = false;
+    std::vector<std::pair<std::pair<int64_t, int64_t>, std::vector<int32_t>>> v;
+    for (const Edit& e : es) v.push_back({{e.a, e.d}, e.rep});
+    return p.edits(std::move(v), seam, err);
+}
 bool Model::feed_mark(const int* tokens, int n, int logits_rows, int slot, std::string& err) {
     Impl& p = *p_;
     PromptFeed pf(p.prompt_feed);
@@ -11293,6 +11995,9 @@ void Model::reset() { p_->reset(); }
 void Model::checkpoint(int slot) { p_->checkpoint(slot); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
 bool Model::splice_out(int64_t a, int64_t d, std::string& err) { return p_->splice_out(a, d, err); }
+bool Model::splice_in(const uint8_t* slot, size_t bytes, int64_t s0, int64_t n, std::string& err) {
+    return p_->splice_in(slot, bytes, s0, n, err);
+}
 int64_t Model::splice_window() const { return p_->g.win; }
 int64_t Model::splice_align() const {
     int64_t align = 1;

@@ -33,6 +33,9 @@ __host__ __device__ constexpr size_t kv_row_bytes(int fmt, int d) {
                            : ((size_t) d / 2 + (size_t) d / 32 + 15) / 16 * 16;
 }
 
+/// n_rows packed rows (kKvFp4, kKvFp4p or kKvFp8, d values each) to F32 out[n_rows][d]: the exact values
+void unpack_rows(const uint8_t* rows, int fmt, int n_rows, int d, float* out, cudaStream_t s);
+
 /// h[t][s][e] = BF16 rows[t][e] for each of the hc streams.
 void embed(const uint16_t* rows_bf16, int T, float* h, int dim, int hc, cudaStream_t s);
 

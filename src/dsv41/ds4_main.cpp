@@ -51,6 +51,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -414,6 +415,88 @@ static void load_newlines(const std::string& pack) {
         }
         i = k;
     }
+}
+
+// ---- KV splice (DS4_SPLICE_EDIT=1): a prompt changed in the middle of
+// a kept state is spliced in place (Model::splice_edits), not re-read.
+struct EditPlan {
+    std::vector<strata::ds4::Model::Edit> eds;
+    int64_t E = -1, changed = 0;   // (the state's tokens kept to E)
+    size_t p_end = 0;              // (the prompt read on from here)
+};
+
+// The edits that make ref[0, E) into ids[0, p_end), from the alignment's
+// forward matches; E the latest of `cks` where every edit starts and
+// ends on the grid, fits its positions (room) and keeps W tokens after
+static bool plan_edits(const std::vector<int32_t>& ref, const std::vector<int>& ids, const Align& al, std::vector<int64_t> cks,
+                       int64_t SA, int64_t W, const std::function<int64_t(int64_t, int64_t)>& room, EditPlan& out) {
+    std::vector<int64_t> p_of(ref.size(), -1);
+    int64_t last = -1;
+    for (size_t t = 0; t < ids.size() && t < al.ref_of.size(); ++t) {
+        const int64_t r = al.ref_of[t];
+        if (r > last && r < (int64_t) ref.size()) {
+            p_of[(size_t) r] = (int64_t) t;
+            last = r;
+        }
+    }
+    std::sort(cks.rbegin(), cks.rend());
+    for (int64_t E : cks) {
+        if (E < 256 || E > (int64_t) ref.size() || p_of[(size_t) E - 1] < 0) continue;
+        // the raw gaps between matched runs: ref [ra, rb) -> ids [pa, pb)
+        struct G { int64_t ra, rb, pa, pb; };
+        std::vector<G> gs;
+        int64_t pr = -1, pt = -1;
+        bool ok = true;
+        for (int64_t r = 0; r < E && ok; ++r) {
+            const int64_t t = p_of[(size_t) r];
+            if (t < 0) continue;
+            if (r != pr + 1 || t != pt + 1) {
+                if (pr < 0) ok = false;   // (the starts must agree)
+                gs.push_back({pr + 1, r, pt + 1, t});
+            }
+            pr = r;
+            pt = t;
+        }
+        if (!ok || pr != E - 1) continue;
+        // on the grid (widened over matched tokens), merged where they meet
+        std::vector<G> m;
+        for (G g : gs) {
+            const int64_t lo = g.ra % SA, hi = (SA - g.rb % SA) % SA;
+            g.ra -= lo;
+            g.pa -= lo;
+            g.rb += hi;
+            g.pb += hi;
+            if (!m.empty() && g.ra <= m.back().rb) {
+                m.back().rb = std::max(m.back().rb, g.rb);
+                m.back().pb = std::max(m.back().pb, g.pb);
+            } else {
+                m.push_back(g);
+            }
+        }
+        // (any change of length: an odd one leaves the followers' paired
+        // rows a token off, Model::splice_edits pairs the end anew)
+        const std::vector<G>& f = m;
+        EditPlan ep;
+        for (const G& g : f) {
+            if (!ok) break;
+            if (g.ra < 0 || g.pa < 0 || g.rb + W > E || room(g.ra, g.rb - g.ra) < g.pb - g.pa) {
+                ok = false;
+                break;
+            }
+            strata::ds4::Model::Edit ed;
+            ed.a = g.ra;
+            ed.d = g.rb - g.ra;
+            ed.rep.assign(ids.begin() + g.pa, ids.begin() + g.pb);
+            ep.changed += g.pb - g.pa;
+            ep.eds.push_back(std::move(ed));
+        }
+        if (!ok) continue;
+        ep.E = E;
+        ep.p_end = (size_t) p_of[(size_t) E - 1] + 1;
+        out = std::move(ep);
+        return true;
+    }
+    return false;
 }
 
 // Changed lines move whole: a line holding any new or stale token is
@@ -816,7 +899,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         for (size_t i = slots.size(); i-- > 0;)   // an earlier state of this conversation is superseded
             if (slots[i].tokens.size() <= t.size() && std::equal(slots[i].tokens.begin(), slots[i].tokens.end(), t.begin()))
                 slot_drop(i);
-        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.check_positions()});
+        slots.push_back({t, "", bytes, ++slot_clock, nullptr, m.live_positions()});
         slots.back().data = buf;
         while (true) {   // past the cap: the least recently used conversation in RAM to the folder, or gone
             int ram = 0, disk = 0;
@@ -1036,7 +1119,100 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             const char* v = std::getenv("STRATA_DS4_REORDER");
             return v == nullptr || std::atoi(v) != 0;
         }();
-        if (reorder_on && reuse && pics.empty()) {   // (every kept conversation: the one that reuses most)
+        // DS4_SPLICE_EDIT=1: the kept state a prompt changed in the middle of
+        // is edited in place (the changed spans and a seam DS4_SPLICE_SEAM
+        // after each computed, the rest kept); else the reorder path below
+        static const bool splice_edit_on = std::getenv("DS4_SPLICE_EDIT") && std::atoi(std::getenv("DS4_SPLICE_EDIT")) != 0;
+        static const int64_t splice_seam = std::getenv("DS4_SPLICE_SEAM") ? std::atoll(std::getenv("DS4_SPLICE_SEAM")) : 2048;
+        bool edited = false;
+        if (splice_edit_on && reuse && pics.empty() && !r.ids.empty()) {
+            const int64_t SA = m.splice_align(), SW = m.splice_window();
+            long best = -2;
+            EditPlan bp;
+            int64_t bgain = 0;
+            const auto try_one = [&](long k, const std::vector<int32_t>& t, const std::vector<int64_t>& cks, bool live) {
+                if (t.empty() || t[0] != r.ids[0]) return;
+                Align a2;
+                if (!align_to(t, r.ids, a2)) return;
+                whole_lines(t, r.ids, a2, SA);
+                EditPlan ep;
+                // (a longer span moves its followers on: any length fits)
+                const auto room = [](int64_t, int64_t) { return (int64_t) 1 << 40; };
+                (void) live;
+                if (!plan_edits(t, r.ids, a2, cks, SA, SW, room, ep) || ep.eds.empty()) return;
+                const int64_t gain = (int64_t) ep.p_end - ep.changed - splice_seam * (int64_t) ep.eds.size();
+                if (gain > bgain) {
+                    bgain = gain;
+                    best = k;
+                    bp = std::move(ep);
+                }
+            };
+            try_one(-1, m.tokens(), m.live_positions(), true);
+            for (size_t k = 0; k < slots.size(); ++k) try_one((long) k, slots[k].tokens, slots[k].cks, false);
+            size_t c0 = 0;   // (worth it only past the plain shared prefix)
+            for (const auto& st0 = m.tokens(); c0 < st0.size() && c0 < r.ids.size() && st0[c0] == r.ids[c0];) ++c0;
+            if (best >= -1 && bgain > (int64_t) c0) {
+                std::string e;
+                bool ok = true, touched = false;
+                if (best >= 0) {
+                    const std::vector<int32_t> want = slots[(size_t) best].tokens;
+                    if (m.tokens().empty() == false) slot_put("");   // (it can drop or move kept ones)
+                    best = -2;
+                    for (size_t k = 0; k < slots.size(); ++k)
+                        if (slots[k].tokens == want) best = (long) k;
+                    ok = best >= 0;
+                    if (!ok) e = "the kept conversation went away";
+                    if (ok) {
+                        Slot& sl = slots[(size_t) best];
+                        std::vector<uint8_t> file;
+                        const uint8_t* bytes = nullptr;
+                        size_t nb = 0;
+                        if (sl.data) {
+                            bytes = sl.data->data();
+                            nb = sl.data->size();
+                        } else {
+                            std::ifstream f(sl.path, std::ios::binary);
+                            file.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+                            bytes = file.data();
+                            nb = file.size();
+                        }
+                        touched = true;
+                        ok = nb > 0 && m.slot_load(bytes, nb, (int64_t) sl.tokens.size(), e);
+                    }
+                }
+                if (ok && bp.E < m.pos()) {
+                    touched = true;
+                    ok = m.restore(bp.E) && m.pos() == bp.E;
+                    if (!ok) e = "no checkpoint at the cut point";
+                }
+                const double t0 = now_ms();
+                int64_t nchanged = 0;
+                for (const auto& ed : bp.eds) nchanged += (int64_t) ed.rep.size();
+                if (ok) {
+                    touched = true;
+                    ok = m.splice_edits(bp.eds, splice_seam, e);
+                }
+                const auto& st1 = m.tokens();
+                if (ok && !(st1.size() == bp.p_end && std::equal(st1.begin(), st1.end(), r.ids.begin()))) {
+                    ok = false;
+                    e = "the edited state differs from the prompt";
+                }
+                if (ok) {
+                    edited = true;
+                    std::fprintf(stderr, "ds4 serve: spliced in place: %zu edits (%lld tokens new), %zu tokens kept, %zu to read "
+                                         "(%.0f ms)\n", bp.eds.size(), (long long) nchanged, bp.p_end, r.ids.size() - bp.p_end,
+                                 now_ms() - t0);
+                } else {
+                    std::fprintf(stderr, "ds4 serve: splice-edit not done (%s)%s\n", e.c_str(),
+                                 touched ? " - the prompt is read again from its start" : "");
+                    if (touched) {
+                        m.reset();
+                        held.clear();
+                    }
+                }
+            }
+        }
+        if (!edited && reorder_on && reuse && pics.empty()) {   // (every kept conversation: the one that reuses most)
             long ref_slot = -2;   // (-1: the state in the model)
             Align al;
             int64_t E = -1, best_gain = 0;
@@ -1149,6 +1325,23 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             };
             consider(-1, m.tokens(), m.live_positions());
             for (size_t k = 0; k < slots.size(); ++k) consider((long) k, slots[k].tokens, slots[k].cks);
+            // the live state's plain prefix wins over a kept one's splice
+            // that reuses less (an old copy kept being picked, its stale
+            // span cut, the newer state's tail read again every turn)
+            if (ref_slot >= 0 && !m.tokens().empty()) {
+                const auto& lt = m.tokens();
+                size_t lp = 0;
+                while (lp < lt.size() && lp < r.ids.size() && lt[lp] == r.ids[lp]) ++lp;
+                int64_t lc = 0;
+                for (int64_t c : m.live_positions())
+                    if (c <= (int64_t) lp) lc = std::max(lc, c);
+                if (lc >= 256 && lc > best_gain) {
+                    std::fprintf(stderr, "ds4 serve: the live state reuses %lld (a kept one's splice %lld): kept as is\n",
+                                 (long long) lc, (long long) best_gain);
+                    ref_slot = -2;
+                    E = -1;
+                }
+            }
             const std::vector<int32_t>* ref = ref_slot >= 0 ? &slots[(size_t) ref_slot].tokens
                                               : ref_slot == -1 ? &m.tokens() : nullptr;
             if (ref != nullptr) {
@@ -1524,6 +1717,23 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                          "%.1f ms waited, %lld swapped in (%lld refused)\n",
                          s.experts ? 100.0 * (double) s.kx_experts / (double) s.experts : 0.0, (long long) s.kx_moved,
                          (long long) s.kx_fails, s.kx_wait_ms, (long long) s.kx_swaps, (long long) s.kx_swap_fails);
+        {   // DS4_PROF: this turn's decode, by stage (ms a token)
+            static long long pt0 = 0;
+            static double pm0[6] = {};
+            if (s.prof_tokens > pt0) {
+                const double pt = (double) (s.prof_tokens - pt0);
+                double d[6], sum = 0;
+                for (int i = 0; i < 6; ++i) {
+                    d[i] = (s.prof_ms[i] - pm0[i]) / pt;
+                    sum += d[i];
+                    pm0[i] = s.prof_ms[i];
+                }
+                pt0 = s.prof_tokens;
+                std::fprintf(stderr, "maya ds4 serve: decode GPU per token %.2f ms: between layers %.2f, attention %.2f, "
+                             "routing + shared %.2f, experts gate/up %.2f, waiting for the CPU lane %.2f, down + post %.2f\n",
+                             sum, d[0], d[1], d[2], d[3], d[4], d[5]);
+            }
+        }
         m.save_profile();
     }
     // the engine ends (QUIT or the end of its input): the conversation in the model is set aside, and every one in
@@ -1601,10 +1811,30 @@ bool read_score_ids(const std::string& path, std::vector<ScoreSeg>& segs, std::s
     return true;
 }
 
+static bool st_meta_tokens(const std::string& path, std::vector<int>& out, std::string& err);
+
 int score(strata::ds4::Model& m, const std::string& ids_path, const std::string& out_path, int window, int eos) {
     std::vector<ScoreSeg> segs;
     std::string err;
-    if (!read_score_ids(ids_path, segs, err)) {
+    // a slot's .meta: its tokens [a, b) (DS4_SCORE_RANGE=a:b) as one segment
+    const auto ends = [&](const char* x) {
+        const size_t k = std::strlen(x);
+        return ids_path.size() > k && ids_path.compare(ids_path.size() - k, k, x) == 0;
+    };
+    if (ends(".meta") || ends(".ids")) {
+        ScoreSeg sg;
+        sg.name = "slot";
+        if (!st_meta_tokens(ids_path, sg.ids, err)) {
+            std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
+            return 1;
+        }
+        if (const char* rg = std::getenv("DS4_SCORE_RANGE")) {
+            const long long a = std::atoll(rg), b = std::strchr(rg, ':') ? std::atoll(std::strchr(rg, ':') + 1) : (long long) sg.ids.size();
+            sg.ids = std::vector<int>(sg.ids.begin() + std::min<long long>(a, (long long) sg.ids.size()),
+                                      sg.ids.begin() + std::min<long long>(b, (long long) sg.ids.size()));
+        }
+        segs.push_back(std::move(sg));
+    } else if (!read_score_ids(ids_path, segs, err)) {
         std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
         return 1;
     }
@@ -1639,10 +1869,15 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
         size_t a0 = 0;
         if (prefix_n > 0 && (size_t) prefix_n + 1 < ids.size()) {
             a0 = (size_t) prefix_n;
-            if (!m.feed(ids.data(), (int) a0, 1, err)) {
-                std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
-                return 1;
-            }
+            // DS4_SCORE_UNITS=1: the prefix in feed_unit() pieces, as serve reads a prompt
+            const bool units = std::getenv("DS4_SCORE_UNITS") != nullptr;
+            const size_t u = units ? (size_t) std::max(1, m.feed_unit()) : a0;
+            for (size_t q = 0; q < a0; q += u)
+                if (!m.feed(ids.data() + q, (int) std::min(u, a0 - q), 1, err)) {
+                    std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
+                    return 1;
+                }
+            if (units) std::fprintf(stderr, "score: the prefix in pieces of %zu\n", u);
         }
         for (size_t a = a0; a + 1 < ids.size();) {
             const int T = (int) std::min<size_t>((size_t) window, ids.size() - 1 - a);   // (positions a .. a+T-1 are scored)
@@ -1692,6 +1927,543 @@ int score(strata::ds4::Model& m, const std::string& ids_path, const std::string&
     std::fclose(out);
     return 0;
 }
+// ---- block-cache research: splice quality ---------------------------------------------------------------------
+// --splice-test MAIN.meta --splice-junk JUNK.meta: a block B = MAIN[a1, E) whose state was made after a foreign
+// span (JUNK's tokens, cut out again with splice_out), the last S tokens of B read fresh (the seam), against the
+// same tokens read whole; MAIN[E, E + nc) scored. Env: DS4_ST_A1, DS4_ST_B (B's length), DS4_ST_NC (64),
+// DS4_ST_JUNK ("512,4096": junk lengths), DS4_ST_SEAMS ("0,128,256"), DS4_ST_JUNK_OFF (0).
+static bool st_meta_tokens(const std::string& path, std::vector<int>& out, std::string& err) {
+    // (a .ids file: a raw int32 dump, DS4_DUMP_IDS's)
+    if (path.size() > 4 && path.compare(path.size() - 4, 4, ".ids") == 0) {
+        std::ifstream g(path, std::ios::binary | std::ios::ate);
+        const std::streamsize sz = g.tellg();
+        if (!g || sz <= 0 || sz % 4 != 0) {
+            err = path + ": not an ids dump";
+            return false;
+        }
+        std::vector<int32_t> t((size_t) sz / 4);
+        g.seekg(0);
+        g.read((char*) t.data(), sz);
+        out.assign(t.begin(), t.end());
+        return true;
+    }
+    std::ifstream f(path, std::ios::binary);
+    uint64_t m0 = 0, il = 0, bytes = 0, nt = 0;
+    if (!f.read((char*) &m0, 8) || m0 != strata::ds4::slotmeta::kMagic || !f.read((char*) &il, 8)) {
+        err = path + ": not a slot .meta";
+        return false;
+    }
+    f.seekg((std::streamoff) il, std::ios::cur);
+    if (!f.read((char*) &bytes, 8) || !f.read((char*) &nt, 8) || nt == 0 || nt > (1ull << 24)) {
+        err = path + ": damaged";
+        return false;
+    }
+    std::vector<int32_t> t(nt);
+    if (!f.read((char*) t.data(), (std::streamsize) (nt * 4))) {
+        err = path + ": cut short";
+        return false;
+    }
+    out.assign(t.begin(), t.end());
+    return true;
+}
+
+static std::vector<int> st_list(const char* env, const char* def) {
+    const char* v = std::getenv(env);
+    return parse_ids(v ? v : def);
+}
+
+// teacher-forced: feeds c[0, nc) (the state ends just before c[0]) and keeps each row's log-softmax (row t: c[t + 1])
+static bool st_score(strata::ds4::Model& m, const std::vector<int>& c, int nc, std::vector<float>& lp, std::string& err) {
+    const int V = m.vocab();
+    lp.assign((size_t) nc * (size_t) V, 0.0f);
+    std::vector<float> lg;
+    for (int a = 0; a < nc;) {
+        const int T = std::min(16, nc - a);
+        if (!m.feed(c.data() + a, T, T, err) || !m.logits(lg) || lg.size() < (size_t) T * (size_t) V) {
+            if (err.empty()) err = "no logits";
+            return false;
+        }
+        for (int t = 0; t < T; ++t) {
+            const float* r = lg.data() + (size_t) t * (size_t) V;
+            float mx = r[0];
+            for (int v = 1; v < V; ++v) mx = std::max(mx, r[v]);
+            double z = 0.0;
+            for (int v = 0; v < V; ++v) z += std::exp((double) (r[v] - mx));
+            const float lz = (float) (std::log(z) + (double) mx);
+            float* o = lp.data() + (size_t) (a + t) * (size_t) V;
+            for (int v = 0; v < V; ++v) o[v] = r[v] - lz;
+        }
+        a += T;
+    }
+    return true;
+}
+
+static void st_report(const char* name, const std::vector<float>& ref, const std::vector<float>& var, const std::vector<int>& c,
+                      int nc, int V) {
+    double kl = 0.0, klmax = 0.0, nr = 0.0, nv = 0.0;
+    int agree = 0;
+    for (int t = 0; t + 1 < nc; ++t) {
+        const float* p = ref.data() + (size_t) t * (size_t) V;
+        const float* q = var.data() + (size_t) t * (size_t) V;
+        double k = 0.0;
+        int ap = 0, aq = 0;
+        for (int v = 0; v < V; ++v) {
+            const double pv = std::exp((double) p[v]);
+            if (pv > 1e-12) k += pv * ((double) p[v] - (double) q[v]);
+            if (p[v] > p[ap]) ap = v;
+            if (q[v] > q[aq]) aq = v;
+        }
+        kl += k;
+        klmax = std::max(klmax, k);
+        agree += ap == aq;
+        nr -= p[c[(size_t) t + 1]];
+        nv -= q[c[(size_t) t + 1]];
+    }
+    const int n = std::max(1, nc - 1);
+    std::fprintf(stderr, "splice-test %-26s KL mean %.5f max %.4f | top-1 agrees %5.1f%% | ppl ref %.4f this %.4f\n", name,
+                 kl / n, klmax, 100.0 * agree / n, std::exp(nr / n), std::exp(nv / n));
+}
+
+// DS4_ST_EDIT_A=a: the edit test instead - MAIN[a, a + D) replaced by
+// N junk tokens (DS4_ST_EDIT_D, _N), the state to E (DS4_ST_EDIT_E);
+// splice_edit on MAIN's state against the edited prompt read whole
+static int splice_edit_test(strata::ds4::Model& m, const std::vector<int>& ids, const std::vector<int>& junk) {
+    std::string err;
+    const auto num = [](const char* k, long long d) { return std::getenv(k) ? std::atoll(std::getenv(k)) : d; };
+    const int64_t al = m.splice_align();
+    const int64_t a = num("DS4_ST_EDIT_A", 8192) / al * al, D = num("DS4_ST_EDIT_D", 512) / al * al;
+    const int64_t N = std::min<int64_t>(num("DS4_ST_EDIT_N", D) / al * al, D), E = num("DS4_ST_EDIT_E", 16384);
+    const int64_t joff = num("DS4_ST_JUNK_OFF", 0), mk = num("DS4_ST_MARK", a / 2048 * 2048);
+    const int nc = (int) num("DS4_ST_NC", 64);
+    if (E + nc + 1 > (int64_t) ids.size() || a + D + 128 > E || joff + N > (int64_t) junk.size()) {
+        std::fprintf(stderr, "strata-dsv41: the edit test does not fit the tokens given\n");
+        return 1;
+    }
+    const std::vector<int32_t> rep(junk.begin() + joff, junk.begin() + joff + N);
+    const std::vector<int> cont(ids.begin() + E, ids.begin() + E + nc + 1);
+    std::vector<int> edited(ids.begin(), ids.begin() + a);
+    edited.insert(edited.end(), rep.begin(), rep.end());
+    edited.insert(edited.end(), ids.begin() + a + D, ids.begin() + E);
+    const int V = m.vocab();
+    const double t0 = now_ms();
+    std::vector<float> ref, var;
+    m.reset();
+    if (!m.feed(edited.data(), (int) edited.size(), 1, err) || !st_score(m, cont, nc, ref, err)) {
+        std::fprintf(stderr, "strata-dsv41: the reference: %s\n", err.c_str());
+        return 1;
+    }
+    std::fprintf(stderr, "splice-edit: [%lld, %lld) -> %lld junk tokens, state to %lld, mark at %lld; reference (%.0f s)\n",
+                 (long long) a, (long long) (a + D), (long long) N, (long long) E, (long long) mk, (now_ms() - t0) / 1000.0);
+    // the unedited state, a mark before the edit (serve keeps them);
+    // an edit moves rows after a, so each run reads [mk, E) again
+    m.reset();
+    if (!m.feed(ids.data(), (int) mk, 1, err)) return 1;
+    m.mark();
+    const auto unedited = [&] {
+        if (!m.restore(mk) || m.pos() != mk || !m.feed(ids.data() + mk, (int) (E - mk), 1, err)) {
+            std::fprintf(stderr, "strata-dsv41: the unedited state: %s\n", err.c_str());
+            return false;
+        }
+        return true;
+    };
+    // the stale state as is (no edit), for scale
+    std::vector<float> stale;
+    if (!unedited() || !st_score(m, cont, nc, stale, err)) return 1;
+    st_report("unedited state", ref, stale, cont, nc, V);
+    for (int x : st_list("DS4_ST_SEAMS", "0,32,128,512")) {
+        if (!unedited()) return 1;
+        const double t1 = now_ms();
+        if (!m.splice_edit(a, D, rep, x, err)) {
+            std::fprintf(stderr, "strata-dsv41: splice_edit: %s\n", err.c_str());
+            return 1;
+        }
+        const double ms = now_ms() - t1;
+        if (!st_score(m, cont, nc, var, err)) return 1;
+        char nm[64];
+        std::snprintf(nm, sizeof nm, "edited, seam %d (%.1f s)", x, ms / 1000.0);
+        st_report(nm, ref, var, cont, nc, V);
+    }
+    std::fprintf(stderr, "splice-edit: done (%.0f s)\n", (now_ms() - t0) / 1000.0);
+    return 0;
+}
+
+// DS4_ST_DRIFT=1 (the edit test's settings): the followers' compressed
+// rows by distance from the edit, against the edited prompt read whole
+static int splice_drift_test(strata::ds4::Model& m, const std::vector<int>& ids, const std::vector<int>& junk) {
+    std::string err;
+    const auto num = [](const char* k, long long d) { return std::getenv(k) ? std::atoll(std::getenv(k)) : d; };
+    const int64_t al = m.splice_align();
+    const int64_t a = num("DS4_ST_EDIT_A", 8192) / al * al, D = num("DS4_ST_EDIT_D", 512) / al * al;
+    const int64_t N = std::min<int64_t>(num("DS4_ST_EDIT_N", D) / al * al, D), E = num("DS4_ST_EDIT_E", 16384);
+    const int64_t joff = num("DS4_ST_JUNK_OFF", 0), mk = num("DS4_ST_MARK", a / 2048 * 2048);
+    if (a + D + 128 > E || E > (int64_t) ids.size() || joff + N > (int64_t) junk.size()) {
+        std::fprintf(stderr, "strata-dsv41: the drift test does not fit the tokens given\n");
+        return 1;
+    }
+    // DS4_ST_EDITS=k edits, DS4_ST_EDIT_GAP apart (the first at a), each
+    // D tokens -> N junk tokens (junk taken further along each time)
+    const int64_t K = std::max<long long>(1, num("DS4_ST_EDITS", 1)), gap = num("DS4_ST_EDIT_GAP", 2048) / al * al;
+    std::vector<strata::ds4::Model::Edit> eds;
+    for (int64_t i = 0; i < K; ++i) {
+        strata::ds4::Model::Edit ed;
+        ed.a = a + i * gap;
+        ed.d = D;
+        const int64_t jo = joff + i * N;
+        if (ed.a + D + 128 > E || jo + N > (int64_t) junk.size() || (i > 0 && ed.a < eds.back().a + D)) {
+            std::fprintf(stderr, "strata-dsv41: edit %lld does not fit\n", (long long) i);
+            return 1;
+        }
+        ed.rep.assign(junk.begin() + jo, junk.begin() + jo + N);
+        eds.push_back(std::move(ed));
+    }
+    const std::vector<int32_t> rep = eds[0].rep;
+    std::vector<int> edited;
+    int64_t at = 0;
+    for (const auto& ed : eds) {
+        edited.insert(edited.end(), ids.begin() + at, ids.begin() + ed.a);
+        edited.insert(edited.end(), ed.rep.begin(), ed.rep.end());
+        at = ed.a + ed.d;
+    }
+    edited.insert(edited.end(), ids.begin() + at, ids.begin() + E);
+    // (the followers of the last edit start at f0, in the edited numbering)
+    const int64_t E2 = (int64_t) edited.size(), f0 = eds.back().a + ((int64_t) eds.size() - 1) * (N - D) + N;
+    const int ns = m.kv_sources();
+    const std::vector<int64_t> edges = {0, 16, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 1 << 30};
+    // every source's follower rows of the state as it is now
+    const auto grab = [&](std::vector<std::vector<float>>& out) {
+        out.assign((size_t) ns, {});
+        for (int s = 0; s < ns; ++s) {
+            const int64_t R = m.kv_ratio(s), r0 = (f0 + R - 1) / R, r1 = E2 / R;
+            if (r1 > r0 && !m.kv_rows(s, r0, r1 - r0, out[(size_t) s], err)) return false;
+        }
+        return true;
+    };
+    std::vector<std::vector<float>> ref, var;
+    const auto show = [&](const char* name) {
+        for (int s = 0; s < ns; ++s) {
+            const int64_t R = m.kv_ratio(s), r0 = (f0 + R - 1) / R, nrow = E2 / R - r0;
+            if (nrow <= 0 || ref[(size_t) s].empty()) continue;
+            const int hd = (int) (ref[(size_t) s].size() / (size_t) nrow);
+            std::vector<double> sum(edges.size(), 0.0);
+            std::vector<long> cnt(edges.size(), 0);
+            const size_t rows = ref[(size_t) s].size() / (size_t) hd;
+            for (size_t r = 0; r < rows; ++r) {
+                const float* x = ref[(size_t) s].data() + r * (size_t) hd;
+                const float* y = var[(size_t) s].data() + r * (size_t) hd;
+                double dd = 0, xx = 0;
+                for (int e = 0; e < hd; ++e) {
+                    dd += ((double) x[e] - y[e]) * ((double) x[e] - y[e]);
+                    xx += (double) x[e] * x[e];
+                }
+                const int64_t dist = (r0 + (int64_t) r) * R - f0;
+                size_t b = 0;
+                while (b + 1 < edges.size() && dist >= edges[b + 1]) ++b;
+                sum[b] += std::sqrt(dd / std::max(1e-30, xx));
+                ++cnt[b];
+            }
+            std::string line;
+            for (size_t b = 0; b + 1 < edges.size(); ++b)
+                if (cnt[b] > 0) {
+                    char c[32];
+                    std::snprintf(c, sizeof c, " %7.4f", sum[b] / (double) cnt[b]);
+                    line += c;
+                }
+            std::fprintf(stderr, "drift %-22s layer %2d:%s\n", name, m.kv_layer(s), line.c_str());
+        }
+    };
+    std::fprintf(stderr, "drift: edit [%lld, %lld) -> %lld junk tokens, followers from %lld to %lld, mark %lld\n", (long long) a,
+                 (long long) (a + D), (long long) N, (long long) f0, (long long) E2, (long long) mk);
+    std::fprintf(stderr, "drift: relative row error by distance from the edit, buckets from 0 16 64 128 256 512 1K 2K 4K 8K\n");
+    m.reset();
+    if (!m.feed(edited.data(), (int) E2, 1, err) || !grab(ref)) {
+        std::fprintf(stderr, "strata-dsv41: the reference: %s\n", err.c_str());
+        return 1;
+    }
+    // the floor: the same edited tokens, read in the pieces a splice uses
+    m.reset();
+    if (!m.feed(edited.data(), (int) mk, 1, err)) return 1;
+    m.mark();
+    if (!m.feed(edited.data() + mk, (int) (E2 - mk), 1, err) || !grab(var)) return 1;
+    show("noise (same tokens)");
+    if (N == D) {   // the edit ignored (the followers at the same rows)
+        m.reset();
+        if (!m.feed(ids.data(), (int) E, 1, err) || !grab(var)) return 1;
+        show("edit ignored");
+    }
+    for (int x : st_list("DS4_ST_SEAMS", "0,128")) {
+        // (the unedited state with a mark every 2048, as serve keeps them)
+        m.reset();
+        for (int64_t q = 0; q < E; q += 2048) {
+            if (!m.feed(ids.data() + q, (int) std::min<int64_t>(2048, E - q), 1, err)) return 1;
+            m.mark();
+        }
+        const double t1 = now_ms();
+        if (!m.splice_edits(eds, x, err) || !grab(var)) {
+            std::fprintf(stderr, "strata-dsv41: the splice: %s\n", err.c_str());
+            return 1;
+        }
+        const std::vector<int32_t>& st = m.tokens();
+        const bool same = st.size() == edited.size() && std::equal(st.begin(), st.end(), edited.begin());
+        char nm[48];
+        std::snprintf(nm, sizeof nm, "spliced, seam %d (%.1f s%s)", x, (now_ms() - t1) / 1000.0, same ? "" : ", TOKENS DIFFER");
+        show(nm);
+    }
+    return 0;
+}
+
+// DS4_ST_STRESS=trials: random multi-edits (every kind) on one base state
+// of MAIN[0, E); each checked by its tokens and by copy probes of the
+// edited spans and of unedited ones (the control)
+static int splice_stress_test(strata::ds4::Model& m, const std::vector<int>& ids, const std::vector<int>& junk) {
+    std::string err;
+    const auto num = [](const char* k, long long d) { return std::getenv(k) ? std::atoll(std::getenv(k)) : d; };
+    const int64_t al = m.splice_align(), W = m.splice_window();
+    const int64_t E = num("DS4_ST_EDIT_E", 16384), trials = num("DS4_ST_STRESS", 12), seam = num("DS4_SPLICE_SEAM", 2048);
+    const int64_t maxk = num("DS4_ST_MAXK", 5), joff = num("DS4_ST_JUNK_OFF", 100000);
+    if (E + 1 > (int64_t) ids.size() || joff + 4096 > (int64_t) junk.size()) {
+        std::fprintf(stderr, "strata-dsv41: the tokens are too short for the stress test\n");
+        return 1;
+    }
+    const double t0 = now_ms();
+    // (the base: marks every DS4_ST_BASE_STEP tokens, default one read)
+    const int64_t bstep = num("DS4_ST_BASE_STEP", E);
+    for (int64_t q = 0; q < E; q += bstep) {
+        if (!m.feed(ids.data() + q, (int) std::min<int64_t>(bstep, E - q), 1, err)) {
+            std::fprintf(stderr, "strata-dsv41: the base: %s\n", err.c_str());
+            return 1;
+        }
+        m.mark();
+        std::fprintf(stderr, "stress: base %lld of %lld tokens (%.0f s)\n", (long long) std::min(q + bstep, E), (long long) E,
+                     (now_ms() - t0) / 1000.0);
+    }
+    std::vector<uint8_t> base;
+    if (m.slot_save(base, err) == 0) {
+        std::fprintf(stderr, "strata-dsv41: saving the base: %s\n", err.c_str());
+        return 1;
+    }
+    std::mt19937_64 rng((uint64_t) num("DS4_ST_SEED", 1));
+    const auto rnd = [&](int64_t lo, int64_t hi) { return lo + (int64_t) (rng() % (uint64_t) (hi - lo + 1)); };
+    // copy probe at s: the 8 tokens there fed, the next 24 scored
+    const auto count8 = [](const std::vector<int>& v, size_t s) {
+        int c = 0;
+        for (size_t i = 0; i + 8 <= v.size(); ++i)
+            if (std::equal(v.begin() + (long) s, v.begin() + (long) s + 8, v.begin() + (long) i)) ++c;
+        return c;
+    };
+    const int V = m.vocab();
+    const auto probe = [&](const std::vector<int>& v, size_t s, int64_t E2, int& hit) {
+        std::vector<int> c(v.begin() + (long) s, v.begin() + (long) s + 32);
+        std::vector<float> lp;
+        if (!st_score(m, c, 32, lp, err)) return false;
+        hit = 0;
+        for (int t = 7; t < 31; ++t) {
+            const float* r = lp.data() + (size_t) t * (size_t) V;
+            hit += (int) (std::max_element(r, r + V) - r) == c[(size_t) t + 1];
+        }
+        return m.restore(E2) && m.pos() == E2;
+    };
+    int64_t bad_tok = 0, n_ed = 0, n_ct = 0, hit_ed = 0, hit_ct = 0, fails = 0;
+    double t_sum = 0.0;
+    for (int64_t tr = 0; tr < trials; ++tr) {
+        if (!m.slot_load(base.data(), base.size(), E, err)) {
+            std::fprintf(stderr, "strata-dsv41: loading the base: %s\n", err.c_str());
+            return 1;
+        }
+        // edits: sorted, apart, every kind; a and d on the grid
+        const int64_t K = rnd(1, maxk);
+        std::vector<int64_t> at;
+        for (int64_t i = 0; i < K; ++i) at.push_back(rnd(2, E - 1024) / al * al);
+        std::sort(at.begin(), at.end());
+        std::vector<strata::ds4::Model::Edit> eds;
+        std::string kinds;
+        int64_t jp = joff + rnd(0, 20000);
+        for (int64_t i = 0; i < K; ++i) {
+            const int kind = (int) rnd(0, 5);
+            int64_t d = rnd(1, 128) * al, n = d;
+            const char* kn = "same";
+            if (kind == 1) n = d + 1, kn = "grow+1";
+            if (kind == 2) n = d + rnd(16, 300), kn = "grow";
+            if (kind == 3) n = std::max<int64_t>(1, d - rnd(1, d)), kn = "shrink";
+            if (kind == 4) n = 0, kn = "delete";
+            if (kind == 5) d = 0, n = rnd(16, 300), kn = "insert";
+            const int64_t a = at[(size_t) i];
+            if (!eds.empty() && a < eds.back().a + eds.back().d + 2 * al) continue;   // (overlaps the last)
+            if (a + d + W + 256 > E) continue;
+            strata::ds4::Model::Edit ed;
+            ed.a = a;
+            ed.d = d;
+            ed.rep.assign(junk.begin() + jp, junk.begin() + jp + n);
+            jp += n + 7;
+            eds.push_back(std::move(ed));
+            char b[48];
+            std::snprintf(b, sizeof b, "%s%s@%lld(%lld->%lld)", kinds.empty() ? "" : " ", kn, (long long) a, (long long) d,
+                          (long long) n);
+            kinds += b;
+        }
+        if (eds.empty()) continue;
+        std::vector<int> edited;   // (the prompt, and where each edit landed)
+        std::vector<std::pair<size_t, size_t>> spans;
+        int64_t cur = 0;
+        for (const auto& ed : eds) {
+            edited.insert(edited.end(), ids.begin() + cur, ids.begin() + ed.a);
+            spans.push_back({edited.size(), ed.rep.size()});
+            edited.insert(edited.end(), ed.rep.begin(), ed.rep.end());
+            cur = ed.a + ed.d;
+        }
+        edited.insert(edited.end(), ids.begin() + cur, ids.begin() + E);
+        const int64_t E2 = (int64_t) edited.size();
+        const double t1 = now_ms();
+        if (!m.splice_edits(eds, seam, err)) {
+            ++fails;
+            std::fprintf(stderr, "stress %lld: [%s] SPLICE FAILED: %s\n", (long long) tr, kinds.c_str(), err.c_str());
+            continue;
+        }
+        const double ts = (now_ms() - t1) / 1000.0;
+        t_sum += ts;
+        const std::vector<int32_t>& st = m.tokens();
+        const bool same = (int64_t) st.size() == E2 && m.pos() == E2 && std::equal(st.begin(), st.end(), edited.begin());
+        bad_tok += !same;
+        m.mark();
+        std::string pe, pc;
+        for (const auto& sp : spans) {   // (edited spans of 32+ tokens)
+            if (sp.second < 32 || count8(edited, sp.first) != 1) continue;
+            int h = 0;
+            if (!probe(edited, sp.first, E2, h)) {
+                std::fprintf(stderr, "strata-dsv41: a probe: %s\n", err.c_str());
+                return 1;
+            }
+            ++n_ed;
+            hit_ed += h;
+            pe += " " + std::to_string(h);
+        }
+        for (int c = 0; c < 3; ++c) {   // (unedited, after the first edit)
+            const int64_t lo = (int64_t) spans[0].first + (int64_t) spans[0].second + 64;
+            if (lo + 64 >= E2) break;
+            const size_t s = (size_t) rnd(lo, E2 - 64);
+            bool clear = count8(edited, s) == 1;
+            for (const auto& sp : spans) clear = clear && (s + 32 <= sp.first || s >= sp.first + sp.second);
+            int h = 0;
+            if (!clear) continue;
+            if (!probe(edited, s, E2, h)) {
+                std::fprintf(stderr, "strata-dsv41: a probe: %s\n", err.c_str());
+                return 1;
+            }
+            ++n_ct;
+            hit_ct += h;
+            pc += " " + std::to_string(h);
+        }
+        std::fprintf(stderr, "stress %lld: [%s] %.1f s, tokens %s | edited copies (of 24):%s | controls:%s\n", (long long) tr,
+                     kinds.c_str(), ts, same ? "ok" : "DIFFER", pe.empty() ? " -" : pe.c_str(), pc.empty() ? " -" : pc.c_str());
+    }
+    std::fprintf(stderr, "stress: %lld trials, %lld failed, %lld with wrong tokens; copy accuracy edited %.1f%% (%lld probes), "
+                         "controls %.1f%% (%lld); %.1f s a splice\n",
+                 (long long) trials, (long long) fails, (long long) bad_tok, n_ed ? 100.0 * hit_ed / (24.0 * n_ed) : 0.0,
+                 (long long) n_ed, n_ct ? 100.0 * hit_ct / (24.0 * n_ct) : 0.0, (long long) n_ct,
+                 t_sum / std::max<int64_t>(1, trials - fails));
+    return fails || bad_tok ? 2 : 0;
+}
+
+int splice_test(strata::ds4::Model& m, const std::string& main_meta, const std::string& junk_meta) {
+    std::vector<int> ids, junk;
+    std::string err;
+    if (!st_meta_tokens(main_meta, ids, err) || !st_meta_tokens(junk_meta, junk, err)) {
+        std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
+        return 1;
+    }
+    if (std::getenv("DS4_ST_STRESS")) return splice_stress_test(m, ids, junk);
+    if (std::getenv("DS4_ST_DRIFT")) return splice_drift_test(m, ids, junk);
+    if (std::getenv("DS4_ST_EDIT_A")) return splice_edit_test(m, ids, junk);
+    const int64_t al = m.splice_align(), W = m.splice_window();
+    const int64_t a1 = std::getenv("DS4_ST_A1") ? std::atoll(std::getenv("DS4_ST_A1")) / al * al : 8192;
+    const int64_t B = std::getenv("DS4_ST_B") ? std::atoll(std::getenv("DS4_ST_B")) : 4096;
+    const int nc = std::getenv("DS4_ST_NC") ? std::atoi(std::getenv("DS4_ST_NC")) : 64;
+    const int64_t joff = std::getenv("DS4_ST_JUNK_OFF") ? std::atoll(std::getenv("DS4_ST_JUNK_OFF")) : 0;
+    const int64_t E = a1 + B;
+    if (E + nc + 1 > (int64_t) ids.size()) {
+        std::fprintf(stderr, "strata-dsv41: %s has %zu tokens, the test needs %lld\n", main_meta.c_str(), ids.size(), (long long) (E + nc + 1));
+        return 1;
+    }
+    const std::vector<int> cont(ids.begin() + E, ids.begin() + E + nc + 1);
+    const int V = m.vocab();
+    std::fprintf(stderr, "splice-test: X = [0, %lld), B = [%lld, %lld), %d scored after it; grid %lld, window %lld\n",
+                 (long long) a1, (long long) a1, (long long) E, nc, (long long) al, (long long) W);
+    auto feed = [&](const int* p, int64_t n) {
+        if (n <= 0) return true;
+        if (!m.feed(p, (int) n, 1, err)) {
+            std::fprintf(stderr, "strata-dsv41: feed: %s\n", err.c_str());
+            return false;
+        }
+        return true;
+    };
+    std::vector<float> ref, var;
+    const double t0 = now_ms();
+    const std::vector<int64_t> seams = [&] {
+        std::vector<int64_t> v;
+        for (int x : st_list("DS4_ST_SEAMS", "0,128,256")) v.push_back(std::min<int64_t>(x, B - W));
+        return v;
+    }();
+    std::vector<int64_t> junks;
+    for (int x : st_list("DS4_ST_JUNK", "512,4096")) junks.push_back(std::min<int64_t>(x / al * al, (int64_t) junk.size() - joff));
+    // the foreign states first: B (less its seam) read after junk
+    // alone, no X before it - the block a library would hold
+    std::vector<std::vector<uint8_t>> lib;
+    for (int64_t L : junks)
+        for (int64_t S : seams) {
+            m.reset();
+            lib.emplace_back();
+            if (!feed(junk.data() + joff, L) || !feed(ids.data() + a1, B - S) || m.slot_save(lib.back(), err) == 0) {
+                std::fprintf(stderr, "strata-dsv41: the foreign state: %s\n", err.c_str());
+                return 1;
+            }
+        }
+    std::fprintf(stderr, "splice-test: %zu foreign states (%.0f s)\n", lib.size(), (now_ms() - t0) / 1000.0);
+    // X once; every run below goes back to its mark
+    m.reset();
+    if (!feed(ids.data(), a1)) return 1;
+    m.mark();
+    const auto back = [&] {
+        if (!m.restore(a1) || m.pos() != a1) {
+            std::fprintf(stderr, "strata-dsv41: X's mark is gone\n");
+            return false;
+        }
+        return true;
+    };
+    if (!feed(ids.data() + a1, B) || !st_score(m, cont, nc, ref, err)) return 1;
+    std::fprintf(stderr, "splice-test: reference read (%.0f s)\n", (now_ms() - t0) / 1000.0);
+    char nm[64];
+    size_t li = 0;
+    for (size_t ji = 0; ji < junks.size(); ++ji)
+        for (int64_t S : seams) {
+            const int64_t L = junks[ji];
+            if (ji == 0) {   // the control: the same pieces, no junk
+                if (!back() || !feed(ids.data() + a1, B - S) || !feed(ids.data() + E - S, S) || !st_score(m, cont, nc, var, err))
+                    return 1;
+                std::snprintf(nm, sizeof nm, "control, seam %lld", (long long) S);
+                st_report(nm, ref, var, cont, nc, V);
+            }
+            // stale: B read after X and junk, the junk cut out again
+            if (!back() || !feed(junk.data() + joff, L) || !feed(ids.data() + a1, B - S)) return 1;
+            if (!m.splice_out(a1, L, err)) {
+                std::fprintf(stderr, "strata-dsv41: splice_out: %s\n", err.c_str());
+                return 1;
+            }
+            if (!feed(ids.data() + E - S, S) || !st_score(m, cont, nc, var, err)) return 1;
+            std::snprintf(nm, sizeof nm, "cut junk %lld, seam %lld", (long long) L, (long long) S);
+            st_report(nm, ref, var, cont, nc, V);
+            // foreign: B's rows from the state where junk alone came first
+            const std::vector<uint8_t>& sl = lib[li++];
+            if (!back() || !m.splice_in(sl.data(), sl.size(), L, B - S, err)) {
+                std::fprintf(stderr, "strata-dsv41: splice_in: %s\n", err.c_str());
+                return 1;
+            }
+            if (!feed(ids.data() + E - S, S) || !st_score(m, cont, nc, var, err)) return 1;
+            std::snprintf(nm, sizeof nm, "foreign %lld, seam %lld", (long long) L, (long long) S);
+            st_report(nm, ref, var, cont, nc, V);
+        }
+    std::fprintf(stderr, "splice-test: done (%.0f s)\n", (now_ms() - t0) / 1000.0);
+    return 0;
+}
+
 // ---- Strata H100 addition: profile run -------------------------------------------------------------------------
 // --profile-run IDS.json: every segment is fed through the model from a fresh state (no logits); the engine's expert
 // profile (--expert-profile FILE, counts a layer and expert) and DS4_TRACE collect the routing.  The profile is saved
@@ -1806,7 +2578,7 @@ int main(int argc, char** argv) {
     bool serve_mode = false;
     bool pack_info_mode = false;
     std::string images, enc_rgb, enc_out;
-    std::string score_ids, score_out, prof_ids, spec_ids;
+    std::string score_ids, score_out, prof_ids, spec_ids, st_main, st_junk;
     int enc_w = 0, enc_h = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -1877,6 +2649,8 @@ int main(int argc, char** argv) {
         else if (a == "--score-out") score_out = val("--score-out");
         else if (a == "--profile-run") prof_ids = val("--profile-run");
         else if (a == "--spec-eval") spec_ids = val("--spec-eval");
+        else if (a == "--splice-test") st_main = val("--splice-test");
+        else if (a == "--splice-junk") st_junk = val("--splice-junk");
         else if (a == "--serve") serve_mode = true;
         else if (a == "--pack-info") pack_info_mode = true;
         else if (a == "--layer-split") (void) val("--layer-split");   // the server's (this engine balances its own split)
@@ -1896,7 +2670,8 @@ int main(int argc, char** argv) {
         }
         return strata::ds4::pack_info(o.pack, stdout);
     }
-    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty())) {
+    if (o.pack.empty() || (!serve_mode && ids_s.empty() && enc_rgb.empty() && score_ids.empty() && prof_ids.empty() && spec_ids.empty() &&
+                           st_main.empty())) {
         usage();
         return 2;
     }
@@ -1917,6 +2692,7 @@ int main(int argc, char** argv) {
     if (!prof_ids.empty()) return profile_run(m, prof_ids, window);
     if (!spec_ids.empty()) return spec_eval(m, spec_ids, n, window, o.dspark_conf, spec);
     if (!score_ids.empty()) return score(m, score_ids, score_out.empty() ? score_ids + ".tsv" : score_out, window, std::atoi(eos.c_str()));
+    if (!st_main.empty()) return splice_test(m, st_main, st_junk.empty() ? st_main : st_junk);
 
     if (!enc_rgb.empty()) {   // the vision tower alone: a picture's span rows (BF16 [rows][dim]) into --dump-image
         std::vector<uint8_t> px((size_t) std::max(0, enc_w) * std::max(0, enc_h) * 3);

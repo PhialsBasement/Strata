@@ -130,6 +130,23 @@ __device__ __forceinline__ float e2m1_val14(uint32_t c) {
 // a UE8M0 scale byte's value (the byte the F32 exponent: 2^(b - 127); 0 -> 0, an unwritten row's)
 __device__ __forceinline__ float ue8m0_val(uint32_t b) { return __uint_as_float(b << 23); }
 
+// ---------------------------------------------------------------- packed rows back to F32 (splice_in's re-rotation)
+// kKvFp4 (an E4M3 scale per 16), kKvFp4p (UE8M0 per 32) or kKvFp8 (E4M3
+// codes, UE8M0 per 32): the values the finish rounded to, exactly
+__global__ void unpack_rows_kernel(const uint8_t* __restrict__ rows, int fmt, int d, long long rb, float* __restrict__ out) {
+    const uint8_t* r = rows + (long long) blockIdx.x * rb;
+    float* o = out + (long long) blockIdx.x * d;
+    for (int e = threadIdx.x; e < d; e += blockDim.x) {
+        if (fmt == kKvFp8) {
+            o[e] = e4m3_value(r[e]) * ue8m0_val(r[d + e / 32]);
+            continue;
+        }
+        const uint32_t c = (r[e >> 1] >> ((e & 1) * 4)) & 15u;
+        const float s = fmt == kKvFp4 ? e4m3_value(r[d / 2 + e / 16]) : ue8m0_val(r[d / 2 + e / 32]);
+        o[e] = e2m1_val14(c) * 16384.0f * s;
+    }
+}
+
 // ---------------------------------------------------------------- embed
 __global__ void embed_kernel(const uint16_t* __restrict__ rows, float* __restrict__ h, int dim, int hc) {
     const int e = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y;
@@ -2181,6 +2198,12 @@ void init_pre(float* pre, int T, cudaStream_t s) {
     if (strata::dsv41::metal_host::init_pre(pre, T, s)) return;   // the ported MSL kernel
 #endif
     strata_ds4_launch(init_pre_kernel, cdiv(T * 8, 128), 128, 0, s, pre, T);
+}
+
+void unpack_rows(const uint8_t* rows, int fmt, int n_rows, int d, float* out, cudaStream_t s) {
+    if (n_rows <= 0) return;
+    strata_ds4_launch(unpack_rows_kernel, dim3((unsigned) n_rows), dim3(kThreads), 0, s, rows, fmt, d,
+                      (long long) kv_row_bytes(fmt, d), out);
 }
 
 void embed(const uint16_t* rows, int T, float* h, int dim, int hc, cudaStream_t s) {
