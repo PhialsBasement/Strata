@@ -187,7 +187,8 @@ public:
         int64_t a = 0, d = 0;
         std::vector<int32_t> rep;
     };
-    bool splice_edits(const std::vector<Edit>& es, int64_t seam, std::string& err);
+    /// cut_at >= 0: the state is cut back there first (any position)
+    bool splice_edits(const std::vector<Edit>& es, int64_t seam, std::string& err, int64_t cut_at = -1);
     /// The positions [a, a + d) holds (its tokens and the gaps among them)
     int64_t edit_room(int64_t a, int64_t d) const;
     /// The KV sources (research): count, tokens a row, layer, and a

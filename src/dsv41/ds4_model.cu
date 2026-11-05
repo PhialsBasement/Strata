@@ -5984,6 +5984,23 @@ struct Model::Impl {
         return true;
     }
 
+    // The state cut back to p with no checkpoint there: rows kept, the
+    // rings and partial groups stale (edits' fix_end reads them anew)
+    bool truncate(int64_t p) {
+        if (p < 0 || p > pos) return false;
+        pos = p;
+        toks.resize((size_t) pos);
+        ctoks.resize((size_t) pos);
+        slot_held = false;
+        for (Check& o2 : ck)
+            if (o2.pos > pos) o2.pos = -1;
+        hist.erase(std::remove_if(hist.begin(), hist.end(), [&](const Check& h) { return h.pos > pos; }), hist.end());
+        while (cuts.empty() == false && cuts.back().first >= pos) cuts.pop_back();
+        rope_off = cuts.empty() ? 0 : cuts.back().second;
+        return true;
+    }
+    bool fix_end = false;   // (edits: the end's last tokens read anew)
+
     // Cut d tokens at a out of the state: later source rows move
     // down, each ring rotates, and the RoPE gap goes into `cuts`
     // (rows keep their rotation; new positions add rope_off).
@@ -6298,7 +6315,9 @@ struct Model::Impl {
         // are paired anew (the last 256 tokens computed again, kept)
         int64_t align = 1;
         for (int r : g.ratios) align = std::lcm(align, (int64_t) std::max(1, r));
-        const bool odd = shift % align != 0;
+        // (or a state cut where no checkpoint was: fix_end, the same)
+        const bool odd = shift % align != 0 || fix_end;
+        fix_end = false;
         static const bool batch = !std::getenv("DS4_SPLICE_BATCH") || std::atoi(std::getenv("DS4_SPLICE_BATCH")) != 0;
         if (odd) rg.push_back({std::max<int64_t>(0, (pos - 256) / align * align), pos});
         if (batch && chunk > 0) return batch_seams(rg, err);
@@ -11934,11 +11953,26 @@ bool Model::splice_edit(int64_t a, int64_t d, const std::vector<int32_t>& rep, i
     const int64_t e = std::min<int64_t>(p.pos, a + (int64_t) rep.size() + std::max<int64_t>(0, seam));
     return e <= a || p.feed_at(a, e, err);
 }
-bool Model::splice_edits(const std::vector<Edit>& es, int64_t seam, std::string& err) {
+bool Model::splice_edits(const std::vector<Edit>& es, int64_t seam, std::string& err, int64_t cut_at) {
     Impl& p = *p_;
     PromptFeed pf(p.prompt_feed);
     p.pm.last = -1;
     p.halted = false;
+    // (cut_at: the state cut back there first - a checkpoint's rings,
+    // else the end's last tokens read anew in the same run)
+    if (cut_at >= 0 && cut_at < p.pos) {
+        if (p.restorable(cut_at) == cut_at) {
+            if (!p.restore(cut_at) || p.pos != cut_at) {
+                err = "going back to the cut point";
+                return false;
+            }
+        } else if (!p.truncate(cut_at)) {
+            err = "cutting the state back";
+            return false;
+        } else {
+            p.fix_end = true;
+        }
+    }
     std::vector<std::pair<std::pair<int64_t, int64_t>, std::vector<int32_t>>> v;
     for (const Edit& e : es) v.push_back({{e.a, e.d}, e.rep});
     return p.edits(std::move(v), seam, err);

@@ -439,7 +439,14 @@ static bool plan_edits(const std::vector<int32_t>& ref, const std::vector<int>& 
             last = r;
         }
     }
+    // (also the end of the match itself: the state can be cut anywhere)
+    for (int64_t E = (last + 1) / SA * SA; E >= SA && last >= 0; E -= SA)
+        if (p_of[(size_t) E - 1] >= 0) {
+            cks.push_back(E);
+            break;
+        }
     std::sort(cks.rbegin(), cks.rend());
+    cks.erase(std::unique(cks.begin(), cks.end()), cks.end());
     for (int64_t E : cks) {
         if (E < 256 || E > (int64_t) ref.size() || p_of[(size_t) E - 1] < 0) continue;
         // the raw gaps between matched runs: ref [ra, rb) -> ids [pa, pb)
@@ -1207,6 +1214,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             for (size_t k = 0; k < slots.size(); ++k) try_one((long) k, slots[k].tokens, slots[k].cks, false);
             size_t c0 = 0;   // (worth it only past the plain shared prefix)
             for (const auto& st0 = m.tokens(); c0 < st0.size() && c0 < r.ids.size() && st0[c0] == r.ids[c0];) ++c0;
+            if (!(best >= -1 && bgain > (int64_t) c0) && r.ids.size() > c0 + 256)
+                std::fprintf(stderr, "ds4 serve: no splice (best plan keeps %lld, the shared start %zu); reading from %zu\n",
+                             (long long) bgain, c0, c0);
             if (best >= -1 && bgain > (int64_t) c0) {
                 std::string e;
                 bool ok = true, touched = false;
@@ -1236,17 +1246,12 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                         ok = nb > 0 && m.slot_load(bytes, nb, (int64_t) sl.tokens.size(), e);
                     }
                 }
-                if (ok && bp.E < m.pos()) {
-                    touched = true;
-                    ok = m.restore(bp.E) && m.pos() == bp.E;
-                    if (!ok) e = "no checkpoint at the cut point";
-                }
                 const double t0 = now_ms();
                 int64_t nchanged = 0;
                 for (const auto& ed : bp.eds) nchanged += (int64_t) ed.rep.size();
-                if (ok) {
+                if (ok) {   // (cut back to E there: any position)
                     touched = true;
-                    ok = m.splice_edits(bp.eds, splice_seam, e);
+                    ok = m.splice_edits(bp.eds, splice_seam, e, bp.E < m.pos() ? bp.E : -1);
                 }
                 const auto& st1 = m.tokens();
                 if (ok && !(st1.size() == bp.p_end && std::equal(st1.begin(), st1.end(), r.ids.begin()))) {
@@ -1268,7 +1273,9 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                 }
             }
         }
-        if (!edited && reorder_on && reuse && pics.empty()) {   // (every kept conversation: the one that reuses most)
+        // (with the splicer on, no reordering: a state read out of the
+        // client's order is one the next turns cannot splice against)
+        if (!edited && reorder_on && !splice_edit_on && reuse && pics.empty()) {
             long ref_slot = -2;   // (-1: the state in the model)
             Align al;
             int64_t E = -1, best_gain = 0;
