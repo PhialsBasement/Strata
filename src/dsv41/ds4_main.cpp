@@ -499,6 +499,62 @@ static bool plan_edits(const std::vector<int32_t>& ref, const std::vector<int>& 
     return false;
 }
 
+// ---- the block library (DS4_SPLICE_BLOCKS=1: a dry run for now):
+// spans of what a prompt has left to read that a kept conversation
+// (or the state's kept part) already holds, at any position
+struct BlockHit {
+    int src = 0;       // (index into the sources)
+    int64_t s0 = 0;    // (where it sits there)
+    size_t q = 0, n = 0;   // (where it goes in the prompt, its length)
+};
+static std::vector<BlockHit> find_blocks(const std::vector<int>& ids, size_t from,
+                                         const std::vector<const std::vector<int32_t>*>& srcs, int64_t align,
+                                         size_t min_run, int64_t& wrong_parity) {
+    constexpr size_t K = 64;
+    const auto h64 = [](const auto* p) {
+        uint64_t h = 1469598103934665603ull;
+        for (size_t t = 0; t < K; ++t) h = (h ^ (uint32_t) p[t]) * 1099511628211ull;
+        return h;
+    };
+    std::unordered_map<uint64_t, std::vector<std::pair<int, int64_t>>> idx;
+    for (size_t s = 0; s < srcs.size(); ++s)
+        for (size_t o = 0; o + K <= srcs[s]->size(); o += K) idx[h64(srcs[s]->data() + o)].push_back({(int) s, (int64_t) o});
+    std::vector<BlockHit> out;
+    wrong_parity = 0;
+    const size_t n = ids.size();
+    size_t q = from, lo = from;   // (lo: the end of the last block)
+    while (q + K <= n) {
+        const auto it = idx.find(h64(ids.data() + q));
+        BlockHit best;
+        if (it != idx.end())
+            for (size_t c = 0; c < it->second.size() && c < 16; ++c) {
+                const auto& v = *srcs[(size_t) it->second[c].first];
+                const int64_t o = it->second[c].second;
+                if (!std::equal(v.begin() + o, v.begin() + o + (long) K, ids.begin() + (long) q)) continue;
+                size_t b = 0, f = K;
+                while (q - b > lo && o - (int64_t) b > 0 && v[(size_t) (o - (int64_t) b - 1)] == ids[q - b - 1]) ++b;
+                while (q + f < n && (size_t) o + f < v.size() && v[(size_t) o + f] == ids[q + f]) ++f;
+                if (b + f > best.n) best = {it->second[c].first, o - (int64_t) b, q - b, b + f};
+            }
+        if (best.n < min_run) {
+            ++q;
+            continue;
+        }
+        // (the compressed rows' groups must line up: same parity)
+        if (((int64_t) best.q - best.s0) % align != 0) {
+            wrong_parity += (int64_t) best.n;
+        } else {
+            const int64_t cut = (align - (int64_t) best.q % align) % align;
+            best.q += (size_t) cut;
+            best.s0 += cut;
+            best.n = (best.n - (size_t) cut) / (size_t) align * (size_t) align;
+            out.push_back(best);
+        }
+        lo = q = best.q + best.n;
+    }
+    return out;
+}
+
 // Changed lines move whole: a line holding any new or stale token is
 // new (prompt) or stale (ref) as a whole, cuts are widened to the
 // state's group size `align`, and the stale spans are rebuilt.
@@ -1443,6 +1499,27 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
         const size_t n_state = st.size();
         size_t c = 0;
         while (c < n_state && c < r.ids.size() && st[c] == r.ids[c]) ++c;
+        static const bool blocks_on = std::getenv("DS4_SPLICE_BLOCKS") && std::atoi(std::getenv("DS4_SPLICE_BLOCKS")) != 0;
+        if (blocks_on && pics.empty() && r.ids.size() > c + 256) {   // (dry run: what the library would give)
+            const double tb = now_ms();
+            std::vector<int32_t> live(st.begin(), st.begin() + (long) c);
+            std::vector<const std::vector<int32_t>*> srcs{&live};
+            for (const Slot& sl : slots) srcs.push_back(&sl.tokens);
+            int64_t wp = 0;
+            const auto hits = find_blocks(r.ids, c, srcs, m.splice_align(), 256, wp);
+            int64_t cov = 0, big = 0;
+            std::vector<char> from(srcs.size(), 0);
+            for (const auto& h : hits) {
+                cov += (int64_t) h.n;
+                big = std::max<int64_t>(big, (int64_t) h.n);
+                from[(size_t) h.src] = 1;
+            }
+            const size_t left = r.ids.size() - c;
+            std::fprintf(stderr, "ds4 blocks (dry run): %zu to read; %lld of them (%.0f%%) in %zu blocks of 256+ from %d "
+                                 "sources (largest %lld; %lld more at the wrong parity); %.0f ms\n",
+                         left, (long long) cov, 100.0 * (double) cov / (double) left, hits.size(),
+                         (int) std::count(from.begin(), from.end(), 1), (long long) big, (long long) wp, now_ms() - tb);
+        }
         // the same tokens with another picture (or none) do not share the state from that picture's span on
         auto same = [](const std::vector<Pic>& v, const Pic& q) {
             for (const Pic& x : v)
@@ -2363,6 +2440,102 @@ static int splice_stress_test(strata::ds4::Model& m, const std::vector<int>& ids
     return fails || bad_tok ? 2 : 0;
 }
 
+// DS4_ST_PPL=n: the meter check - MAIN[0, E) read, then MAIN[E, E + n)
+// scored by feed windows of 16 and by step() one token at a time, on
+// the same state; their perplexities, KL and top-1 agreement
+static int splice_ppl_check(strata::ds4::Model& m, const std::vector<int>& ids) {
+    std::string err;
+    const auto num = [](const char* k, long long d) { return std::getenv(k) ? std::atoll(std::getenv(k)) : d; };
+    const int64_t E = num("DS4_ST_EDIT_E", 12288), n = num("DS4_ST_PPL", 256);
+    if (E + n + 1 > (int64_t) ids.size()) {
+        std::fprintf(stderr, "strata-dsv41: the tokens are too short for the meter check\n");
+        return 1;
+    }
+    const double t0 = now_ms();
+    // (DS4_ST_PPL_FROM=s: the history is BOS then MAIN[s, E) only)
+    const int64_t from = std::max<long long>(0, num("DS4_ST_PPL_FROM", 0));
+    std::vector<int> hist;
+    if (from > 0) hist.push_back(ids[0]);
+    hist.insert(hist.end(), ids.begin() + from, ids.begin() + E);
+    if (!m.feed(hist.data(), (int) hist.size(), 1, err)) {
+        std::fprintf(stderr, "strata-dsv41: the read: %s\n", err.c_str());
+        return 1;
+    }
+    const int64_t Eh = (int64_t) hist.size();
+    m.mark();
+    std::fprintf(stderr, "ppl: read %lld tokens of history (%.0f s)\n", (long long) Eh, (now_ms() - t0) / 1000.0);
+    const int V = m.vocab();
+    // (row t of each: log-softmax predicting ids[E + t + 1])
+    std::vector<int> c(ids.begin() + E, ids.begin() + E + n + 1);
+    std::vector<float> win;
+    if (!st_score(m, c, (int) n + 1, win, err)) {
+        std::fprintf(stderr, "strata-dsv41: window scoring: %s\n", err.c_str());
+        return 1;
+    }
+    if (!m.restore(Eh) || m.pos() != Eh) {
+        std::fprintf(stderr, "strata-dsv41: no way back to %lld\n", (long long) Eh);
+        return 1;
+    }
+    std::vector<float> stp((size_t) (n + 1) * (size_t) V), lg;
+    int64_t same_pick = 0;   // (greedy sample() = the host row's argmax)
+    std::vector<int> picks;
+    for (int64_t t = 0; t <= n; ++t) {
+        if (!m.step(c[(size_t) t], true, err) || !m.logits(lg) || lg.size() < (size_t) V) {
+            std::fprintf(stderr, "strata-dsv41: step %lld: %s\n", (long long) t, err.c_str());
+            return 1;
+        }
+        const float* r = lg.data() + (lg.size() - (size_t) V);   // (the last row)
+        const int g = m.sample(0.0f, 1.0f, 0, 0.0f, 1, (uint64_t) t);
+        picks.push_back(g);
+        same_pick += g == (int) (std::max_element(r, r + V) - r);
+        if (t == 0) std::fprintf(stderr, "ppl: logits() gives %zu floats a call (vocab %d)\n", lg.size(), V);
+        float mx = r[0];
+        for (int v = 1; v < V; ++v) mx = std::max(mx, r[v]);
+        double z = 0.0;
+        for (int v = 0; v < V; ++v) z += std::exp((double) (r[v] - mx));
+        const float lz = (float) (std::log(z) + (double) mx);
+        for (int v = 0; v < V; ++v) stp[(size_t) t * (size_t) V + (size_t) v] = r[v] - lz;
+    }
+    // per quarter: both perplexities, KL(step || windows), agreement
+    for (int qtr = 0; qtr < 4; ++qtr) {
+        const int64_t a = n * qtr / 4, b = n * (qtr + 1) / 4;
+        double nw = 0, ns = 0, kl = 0;
+        int agree = 0;
+        for (int64_t t = a; t < b; ++t) {
+            const float* p = stp.data() + (size_t) t * (size_t) V;
+            const float* q = win.data() + (size_t) t * (size_t) V;
+            int ap = 0, aq = 0;
+            for (int v = 0; v < V; ++v) {
+                const double pv = std::exp((double) p[v]);
+                if (pv > 1e-12) kl += pv * ((double) p[v] - (double) q[v]);
+                if (p[v] > p[ap]) ap = v;
+                if (q[v] > q[aq]) aq = v;
+            }
+            agree += ap == aq;
+            ns -= p[c[(size_t) t + 1]];
+            nw -= q[c[(size_t) t + 1]];
+        }
+        const double k = (double) std::max<int64_t>(1, b - a);
+        std::fprintf(stderr, "ppl tokens %4lld-%4lld: step() %.3f | windows of 16 %.3f | KL %.4f | top-1 agrees %.1f%%\n",
+                     (long long) a, (long long) b, std::exp(ns / k), std::exp(nw / k), kl / k, 100.0 * agree / k);
+    }
+    // a row off by one: each step() row against the token before and
+    // after the one it should predict
+    double nb = 0, na = 0;
+    int64_t cnt = 0, pick_hits = 0;
+    for (int64_t t = 1; t + 2 <= n; ++t, ++cnt) {
+        const float* p = stp.data() + (size_t) t * (size_t) V;
+        nb -= p[c[(size_t) t]];
+        na -= p[c[(size_t) t + 2]];
+    }
+    for (int64_t t = 0; t < n; ++t) pick_hits += picks[(size_t) t] == c[(size_t) t + 1];
+    std::fprintf(stderr, "ppl step() rows against the token behind %.3f, ahead %.3f; greedy sample() = logits() argmax "
+                         "%lld of %lld; greedy sample() = the text's next token %.1f%%\n",
+                 std::exp(nb / (double) std::max<int64_t>(1, cnt)), std::exp(na / (double) std::max<int64_t>(1, cnt)),
+                 (long long) same_pick, (long long) (n + 1), 100.0 * (double) pick_hits / (double) n);
+    return 0;
+}
+
 int splice_test(strata::ds4::Model& m, const std::string& main_meta, const std::string& junk_meta) {
     std::vector<int> ids, junk;
     std::string err;
@@ -2370,6 +2543,7 @@ int splice_test(strata::ds4::Model& m, const std::string& main_meta, const std::
         std::fprintf(stderr, "strata-dsv41: %s\n", err.c_str());
         return 1;
     }
+    if (std::getenv("DS4_ST_PPL")) return splice_ppl_check(m, ids);
     if (std::getenv("DS4_ST_STRESS")) return splice_stress_test(m, ids, junk);
     if (std::getenv("DS4_ST_DRIFT")) return splice_drift_test(m, ids, junk);
     if (std::getenv("DS4_ST_EDIT_A")) return splice_edit_test(m, ids, junk);
